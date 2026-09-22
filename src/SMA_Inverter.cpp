@@ -25,7 +25,7 @@ SOFTWARE.
 #include "SMA_Inverter.h"
 
 int32_t  value32 = 0;
-int64_t  value64 = 0;
+uint64_t value64 = 0;
 uint64_t totalWh = 0;
 uint64_t totalWh_prev = 0;
 time_t   dateTime = 0;
@@ -82,7 +82,7 @@ E_RC ESP32_SMA_Inverter::getPacket(uint8_t expAddr[6], int wait4Command) {
   int retries = 10;
   do {
     // read L1Hdr
-    uint8_t rdCnt=0;
+    uint16_t rdCnt=0;
     for (rdCnt=0;rdCnt<18;rdCnt++) {
       btrdBuf[rdCnt]= BTgetByte();
       if (readTimeout)  break;
@@ -90,7 +90,7 @@ E_RC ESP32_SMA_Inverter::getPacket(uint8_t expAddr[6], int wait4Command) {
     logD("L1 Rec=%d bytes pkL=0x%04x=%d Cmd=0x%04x\n",
         rdCnt, pL1Hdr->pkLength, pL1Hdr->pkLength, pL1Hdr->command);
 
-    if (rdCnt<17) {
+    if (rdCnt != sizeof(L1Hdr)) {
       logV("L1<18=%d bytes", rdCnt);
       #if (DEBUG_SMA > 2)
       HexDump(BTrdBuf, rdCnt, 10, 'R');
@@ -100,12 +100,22 @@ E_RC ESP32_SMA_Inverter::getPacket(uint8_t expAddr[6], int wait4Command) {
     // Validate L1 header
     if (!((btrdBuf[0] ^ btrdBuf[1] ^ btrdBuf[2]) == btrdBuf[3])) {
       logW("Wrong L1 CRC!!" );
+      return E_CHKSUM;
+    }
+
+    if (pL1Hdr->pkLength < sizeof(L1Hdr) || pL1Hdr->pkLength > sizeof(btrdBuf)) {
+      logE("Invalid L1 packet length: %u", pL1Hdr->pkLength);
+      return E_OVERFLOW;
     }
 
     if (pL1Hdr->pkLength > sizeof(L1Hdr)) { // more bytes to read
       for (rdCnt=18; rdCnt<pL1Hdr->pkLength; rdCnt++) {
         btrdBuf[rdCnt]= BTgetByte();
         if (readTimeout) break;
+      }
+      if (rdCnt != pL1Hdr->pkLength) {
+        logW("Incomplete Bluetooth packet: %u of %u bytes", rdCnt, pL1Hdr->pkLength);
+        return E_NODATA;
       }
       logV("L2 Rec=%d bytes", rdCnt-18);
       #if (DEBUG_SMA > 2)
@@ -126,6 +136,10 @@ E_RC ESP32_SMA_Inverter::getPacket(uint8_t expAddr[6], int wait4Command) {
           bool escNext = false;
 
           for (int i=sizeof(L1Hdr); i<pL1Hdr->pkLength; i++) {
+            if (index >= MAX_PCKT_BUF_SIZE) {
+              logE("pcktBuf overflow! (%d)\n", index);
+              return E_OVERFLOW;
+            }
             pcktBuf[index] = btrdBuf[i];
             //Keep 1st byte raw unescaped 0x7E
             if (escNext == true) {
@@ -137,9 +151,6 @@ E_RC ESP32_SMA_Inverter::getPacket(uint8_t expAddr[6], int wait4Command) {
                 escNext = true; //Throw away the 0x7d byte
               else
                 index++;
-            }
-            if (index >= MAX_PCKT_BUF_SIZE) {
-              logE("pcktBuf overflow! (%d)\n", index);
             }
           }
           pcktBufPos = index;
@@ -172,7 +183,7 @@ E_RC ESP32_SMA_Inverter::getPacket(uint8_t expAddr[6], int wait4Command) {
       logE("Packet retries exceeded");
       ESP.restart();
     }
-  } while (((pL1Hdr->command != wait4Command) || ((rc == E_RETRY)) && (0xFF != wait4Command)) );
+  } while (((pL1Hdr->command != wait4Command) || (rc == E_RETRY)) && (0xFF != wait4Command));
 
   if ((rc == E_OK) ) {
   #if (DEBUG_SMA > 1)
@@ -286,10 +297,25 @@ E_RC ESP32_SMA_Inverter::getInverterDataCfl(uint32_t command, uint32_t first, ui
             validPcktID = true;
             value32 = 0;
             value64 = 0;
-            uint16_t recordsize = 4 * ((uint32_t)pcktBuf[5] - 9) / (get_u32(pcktBuf + 37) - get_u32(pcktBuf + 33) + 1);
+            if (pcktBufPos < 44 || pcktBuf[5] < 9) {
+              logE("Invalid SMA data packet length");
+              return E_INVRESP;
+            }
+            uint32_t firstLri = get_u32(pcktBuf + 33);
+            uint32_t lastLri = get_u32(pcktBuf + 37);
+            if (lastLri < firstLri) {
+              logE("Invalid SMA record range");
+              return E_INVRESP;
+            }
+            uint32_t recordCount = lastLri - firstLri + 1;
+            uint16_t recordsize = 4 * ((uint32_t)pcktBuf[5] - 9) / recordCount;
+            if (recordsize < 16 || recordsize > pcktBufPos - 44) {
+              logE("Invalid SMA record size: %u", recordsize);
+              return E_INVRESP;
+            }
             logD("pcktID=0x%04x recsize=%d BufPos=%d pcktCnt=%04x", 
                             rcvpcktID,   recordsize, pcktBufPos, pcktcount);
-            for (uint16_t ii = 41; ii < pcktBufPos - 3; ii += recordsize) {
+            for (uint16_t ii = 41; ii + recordsize <= pcktBufPos - 3; ii += recordsize) {
               uint8_t *recptr = pcktBuf + ii;
               uint32_t code = get_u32(recptr);
               //LriDef lri = (LriDef)(code & 0x00FFFF00);
@@ -301,10 +327,11 @@ E_RC ESP32_SMA_Inverter::getInverterDataCfl(uint32_t command, uint32_t first, ui
        
               if (recordsize == 16) {
                 value64 = get_u64(recptr + 8);
+                if (value64 == UINT64_MAX || value64 == 0x8000000000000000ULL) value64 = 0;
                 logV("value64=%d=0x%08x",value64, value64);
        
                   //if (is_NaN(value64) || is_NaN((uint64_t)value64)) value64 = 0;
-              } else if ((dataType != 16) && (dataType != 8)) { // ((dataType != DT_STRING) && (dataType != DT_STATUS)) {
+              } else if ((dataType != 16) && (dataType != 8) && recordsize >= 20) { // ((dataType != DT_STRING) && (dataType != DT_STATUS)) {
                 value32 = get_u32(recptr + 16);
                 if ( value32 < 0) value32 = 0;
                 logV("value32=%d=0x%08x",value32, value32);
@@ -382,24 +409,30 @@ E_RC ESP32_SMA_Inverter::getInverterDataCfl(uint32_t command, uint32_t first, ui
                   break;
        
               case DcMsWatt: //SPOT_PDC1 / SPOT_PDC2
-                  invData.Wdc[string[0]] = value32;
-                  dispData.Wdc[string[0]++] = tokW(value32);
+                  if (string[0] < 2) {
+                    invData.Wdc[string[0]] = value32;
+                    dispData.Wdc[string[0]++] = tokW(value32);
+                  }
                   logI("PDC %15.2f kW \n", tokW(value32));
                   //printUnixTime(timeBuf, datetime);
                   break;
        
               case DcMsVol: //SPOT_UDC1 / SPOT_UDC2
                   logI("Udc %15.2f V (%d) \n", toVolt(value32),string[1]);
-                  invData.Udc[string[1]] = value32;
-                  dispData.Udc[string[1]++] = toVolt(value32);
+                  if (string[1] < 2) {
+                    invData.Udc[string[1]] = value32;
+                    dispData.Udc[string[1]++] = toVolt(value32);
+                  }
                   
                   //printUnixTime(timeBuf, datetime);
                   break;
        
               case DcMsAmp: //SPOT_IDC1 / SPOT_IDC2
                   logI("Idc %15.2f A (%d)\n", toAmp(value32),string[2]);
-                  invData.Idc[string[2]] = value32;
-                  dispData.Idc[string[2]++] = toAmp(value32);
+                  if (string[2] < 2) {
+                    invData.Idc[string[2]] = value32;
+                    dispData.Idc[string[2]++] = toAmp(value32);
+                  }
 
                   //printUnixTime(timeBuf, datetime);
                   /* if ((invData.Udc[0]!=0) && (invData.Idc[0] != 0))
@@ -634,7 +667,7 @@ bool ESP32_SMA_Inverter::getBT_SignalStrength() {
   writePacketLength(pcktBuf);
   BTsendPacket(pcktBuf);
 
-  getPacket(invData.BTAddress, 4);
+  if (getPacket(invData.BTAddress, 4) != E_OK || pcktBufPos <= 22) return false;
   dispData.BTSigStrength = ((float)btrdBuf[22] * 100.0f / 255.0f);
   logI("BT-Signal %9.1f %%", dispData.BTSigStrength );
   return true;
@@ -644,7 +677,8 @@ bool ESP32_SMA_Inverter::getBT_SignalStrength() {
 E_RC ESP32_SMA_Inverter::initialiseSMAConnection() {
   //extern uint8_t sixff[6];
   logI(" -> Initialize");
-  getPacket(invData.BTAddress, 2); // 1. Receive
+  E_RC rc = getPacket(invData.BTAddress, 2); // 1. Receive
+  if (rc != E_OK || pcktBufPos <= 22) return (rc == E_OK) ? E_INVRESP : rc;
   invData.NetID = pcktBuf[22];
   logI("SMA netID=%02X\n", invData.NetID);
   writePacketHeader(pcktBuf, 0x02, invData.BTAddress);
@@ -655,7 +689,8 @@ E_RC ESP32_SMA_Inverter::initialiseSMAConnection() {
   writePacketLength(pcktBuf);
 
   BTsendPacket(pcktBuf);             // 1. Reply
-  getPacket(invData.BTAddress, 5); // 2. Receive
+  rc = getPacket(invData.BTAddress, 5); // 2. Receive
+  if (rc != E_OK || pcktBufPos < 32) return (rc == E_OK) ? E_INVRESP : rc;
 
   // Extract ESP32 BT address
   memcpy(espBTAddress, pcktBuf+26,6); 
@@ -679,6 +714,7 @@ E_RC ESP32_SMA_Inverter::initialiseSMAConnection() {
   if (!validateChecksum())
     return E_CHKSUM;
 
+  if (pcktBufPos < 61) return E_INVRESP;
   invData.Serial = get_u32(pcktBuf + 57);
   logW("Serial Nr: %lu\n", invData.Serial);
   return E_OK;
@@ -738,12 +774,15 @@ E_RC ESP32_SMA_Inverter::logonSMAInverter(const char *password, const uint8_t us
       invData.Serial = get_u32(pcktBuf + 17);
       logV("Set:->SUSyID=0x%02X ->Serial=0x%02X ", invData.SUSyID, invData.Serial);
       validPcktID = true;
-      uint8_t retcode = get_u16(pcktBuf + 23);
-      // switch (retcode) {
-      //     case 0: rc = E_OK; break;
-      //     case 0x0100: rc = E_INVPASSW; break;
-      //     default: rc = (E_RC)retcode; break;
-      // }
+      uint16_t retcode = get_u16(pcktBuf + 23);
+      switch (retcode) {
+          case 0: rc = E_OK; break;
+          case 0x0100: rc = E_INVPASSW; break;
+          default:
+            logW("SMA login rejected with status 0x%04X", retcode);
+            rc = E_INVRESP;
+            break;
+      }
     } else { 
       logW("Unexpected response  %02X:%02X:%02X:%02X:%02X:%02X pcktID=0x%04X rcvpcktID=0x%04X now=0x%04X", 
                    btrdBuf[9], btrdBuf[8], btrdBuf[7], btrdBuf[6], btrdBuf[5], btrdBuf[4],
@@ -862,39 +901,39 @@ E_RC ArchiveDayData(time_t startTime) {
 // ******* read SMA current data **********
 E_RC ESP32_SMA_Inverter::ReadCurrentData() {
   if (!btConnected) {
-    charLen += snprintf(charBuf+charLen, CHAR_BUF_MAX-charLen, "Bluetooth offline!\n");
+    logW("Bluetooth offline!");
     return E_NODATA;
   }
   if ((getInverterData(SpotACTotalPower)) != E_OK)  {
-    charLen += snprintf(charBuf+charLen, CHAR_BUF_MAX-charLen, "SpotACTotalPower error!\n" ); // Pac
+    logW("SpotACTotalPower error!"); // Pac
     return E_NODATA;
   }
   if ((getInverterData(SpotDCVoltage)) != E_OK)     {
-    charLen += snprintf(charBuf+charLen, CHAR_BUF_MAX-charLen, "getSpotDCVoltage error!\n" ); // Udc + Idc
+    logW("getSpotDCVoltage error!"); // Udc + Idc
     return E_NODATA;
   }
   if ((getInverterData(SpotACVoltage)) != E_OK)     {
-    charLen += snprintf(charBuf+charLen, CHAR_BUF_MAX-charLen, "getSpotACVoltage error!\n" ); // Uac + Iac
+    logW("getSpotACVoltage error!"); // Uac + Iac
     return E_NODATA;
   }
   if ((getInverterData(EnergyProduction)) != E_OK)  {
-    charLen += snprintf(charBuf+charLen, CHAR_BUF_MAX-charLen, "EnergyProduction error!\n" ); // E-Total + E-Today
+    logW("EnergyProduction error!"); // E-Total + E-Today
     return E_NODATA;
   }
   if ((getInverterData(SpotGridFrequency)) != E_OK) {
-    charLen += snprintf(charBuf+charLen, CHAR_BUF_MAX-charLen, "SpotGridFrequency error!\n");
+    logW("SpotGridFrequency error!");
     return E_NODATA;
   }
   if ((getInverterData(InverterTemp)) != E_OK) {
-    charLen += snprintf(charBuf+charLen, CHAR_BUF_MAX-charLen, "InverterTemp error!\n");
+    logW("InverterTemp error!");
     return E_NODATA;
   }
   if ((getInverterData(DeviceStatus)) != E_OK) {
-    charLen += snprintf(charBuf+charLen, CHAR_BUF_MAX-charLen, "Device Status error!\n");
+    logW("Device Status error!");
     return E_NODATA;
   }
   if ((getInverterData(GridRelayStatus)) != E_OK) {
-    charLen += snprintf(charBuf+charLen, CHAR_BUF_MAX-charLen, "Grid Relay Status error!\n");
+    logW("Grid Relay Status error!");
     return E_NODATA;
   }
 
@@ -1025,4 +1064,3 @@ bool ESP32_SMA_Inverter::validateChecksum() {
     return false;
   }
 }
-

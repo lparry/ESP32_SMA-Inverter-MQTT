@@ -113,7 +113,7 @@ class ESP32_SMA_Inverter_App : public ESP32Loggable {
 
         ~ESP32_SMA_Inverter_App() {}
 
-        char smaInvPass[12];  
+        char smaInvPass[13];  // 12 protocol characters plus C-string terminator
         uint8_t smaBTAddress[6]; // SMA bluetooth address
         //uint8_t  espBTAddress[6]; // is retrieved from BT packet
 

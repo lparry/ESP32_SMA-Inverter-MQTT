@@ -312,16 +312,13 @@ class ESP32_SMA_Inverter : public ESP32Loggable {
 
     BluetoothSerial serialBT = BluetoothSerial();
 
-    uint8_t  btrdBuf[256];    
+    uint8_t  btrdBuf[COMMBUFSIZE];
     uint16_t pcktBufMax = 0; // max. used size of PcktBuf
     uint8_t  espBTAddress[6]; // is retrieved from BT packet
 
     bool btConnected = false;
 
     char timeBuf[24];
-    char charBuf[CHAR_BUF_MAX];
-    int  charLen = 0;
-
   //from SMA_Bluetooth
         uint8_t  pcktBuf[MAX_PCKT_BUF_SIZE];
         uint16_t pcktBufPos = 0;

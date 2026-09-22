@@ -45,10 +45,10 @@ public:
      void wifiLoop();
      void formPage ();
      void handleForm();
-     void brokerConnect();
-     void publishData();
-     void hassAutoDiscover(int timeout);
-     void sendLongMQTT(const char *topic, const char *postscript, const char *msg);
+     bool brokerConnect();
+     bool publishData();
+     bool hassAutoDiscover(int timeout);
+     bool sendLongMQTT(const char *topic, const char *postscript, const char *msg);
      void logViaMQTT(const char *logStr);
 
     String getTime();
@@ -61,6 +61,9 @@ protected:
     std::map<int, std::string> codeMap;
 
 private:
+    uint64_t lastAcceptedETotalWh = 0;
+    uint64_t lastPersistedETotalWh = 0;
+    bool discoveryPublishOK = true;
     // Private constructor to prevent instantiation from outside the class.
     ESP32_SMA_MQTT() : ESP32Loggable("ESP32_SMA_MQTT") {
          initMap();
