@@ -735,6 +735,108 @@ void ESP32_SMA_Inverter::logoffSMAInverter()
   return;
 }
 
+// Read the SMA plant clock. This is the Bluetooth time query used by SBFspot.
+E_RC ESP32_SMA_Inverter::readPlantTime(int32_t *currentTime, int32_t *lastTimeSet,
+                                       int32_t *utcOffsetSeconds, uint32_t *setCount)
+{
+  do {
+    pcktID++;
+    writePacketHeader(pcktBuf, 0x01, sixff);
+    writePacket(pcktBuf, 0x10, 0xA0, 0, 0xFFFF, 0xFFFFFFFF);
+    write32(pcktBuf, 0xF000020A);
+    write32(pcktBuf, 0x00236D00);
+    write32(pcktBuf, 0x00236D00);
+    write32(pcktBuf, 0x00236D00);
+    write32(pcktBuf, 0);
+    write32(pcktBuf, 0);
+    write32(pcktBuf, 0);
+    write32(pcktBuf, 0);
+    write32(pcktBuf, 1);
+    write32(pcktBuf, 1);
+    writePacketTrailer(pcktBuf);
+    writePacketLength(pcktBuf);
+  } while (!isCrcValid(pcktBuf[pcktBufPos - 3], pcktBuf[pcktBufPos - 2]));
+
+  BTsendPacket(pcktBuf);
+  E_RC rc = getPacket(sixff, 1);
+  if (rc != E_OK) return rc;
+  if (pcktBufPos < 68 || !validateChecksum()) return E_INVRESP;
+
+  *currentTime = (int32_t)get_u32(pcktBuf + 45);
+  *lastTimeSet = (int32_t)get_u32(pcktBuf + 49);
+  *utcOffsetSeconds = (int32_t)(get_u32(pcktBuf + 57) & 0xFFFFFFFEUL);
+  *setCount = get_u32(pcktBuf + 61);
+  return E_OK;
+}
+
+E_RC ESP32_SMA_Inverter::syncPlantTime(int32_t utcOffsetSeconds,
+                                       int32_t *beforeTime, int32_t *afterTime)
+{
+  if (!btConnected || beforeTime == nullptr || afterTime == nullptr) return E_BADARG;
+
+  time_t hostNow = time(nullptr);
+  if (hostNow < 1700000000 || hostNow > INT32_MAX) {
+    logW("Refusing clock sync: host time is not plausible");
+    return E_BADARG;
+  }
+
+  int32_t lastTimeSet = 0;
+  int32_t oldOffset = 0;
+  uint32_t setCount = 0;
+  E_RC rc = readPlantTime(beforeTime, &lastTimeSet, &oldOffset, &setCount);
+  if (rc != E_OK) {
+    logW("Unable to read inverter clock before update (%d)", rc);
+    return rc;
+  }
+
+  hostNow = time(nullptr);
+  do {
+    pcktID++;
+    writePacketHeader(pcktBuf, 0x01, sixff);
+    writePacket(pcktBuf, 0x10, 0xA0, 0, 0xFFFF, 0xFFFFFFFF);
+    write32(pcktBuf, 0xF000020A);
+    write32(pcktBuf, 0x00236D00);
+    write32(pcktBuf, 0x00236D00);
+    write32(pcktBuf, 0x00236D00);
+    write32(pcktBuf, (uint32_t)hostNow);
+    write32(pcktBuf, (uint32_t)hostNow);
+    write32(pcktBuf, (uint32_t)hostNow);
+    // The low bit is SMA's daylight-saving flag. The configured offset is
+    // already the current total UTC offset, so leave that flag clear.
+    write32(pcktBuf, (uint32_t)(utcOffsetSeconds & ~1));
+    write32(pcktBuf, setCount + 1);
+    write32(pcktBuf, 1);
+    writePacketTrailer(pcktBuf);
+    writePacketLength(pcktBuf);
+  } while (!isCrcValid(pcktBuf[pcktBufPos - 3], pcktBuf[pcktBufPos - 2]));
+
+  BTsendPacket(pcktBuf);
+  delay(500);
+
+  int32_t verifiedLastSet = 0;
+  int32_t verifiedOffset = 0;
+  uint32_t verifiedSetCount = 0;
+  rc = readPlantTime(afterTime, &verifiedLastSet, &verifiedOffset, &verifiedSetCount);
+  if (rc != E_OK) return rc;
+
+  int64_t difference = (int64_t)*afterTime - (int64_t)time(nullptr);
+  if (difference < 0) difference = -difference;
+  int64_t setDifference = (int64_t)*afterTime - (int64_t)verifiedLastSet;
+  if (setDifference < 0) setDifference = -setDifference;
+  const int32_t requestedOffset = utcOffsetSeconds & ~1;
+  if (difference > 10 || setDifference > 10 ||
+      verifiedOffset != requestedOffset || verifiedSetCount != setCount + 1) {
+    logW("Inverter clock verification failed (host difference=%lld, last-set difference=%lld, offset=%ld expected=%ld, set count=%lu expected=%lu)",
+         difference, setDifference, (long)verifiedOffset, (long)requestedOffset,
+         (unsigned long)verifiedSetCount, (unsigned long)(setCount + 1));
+    return E_INVRESP;
+  }
+
+  logI("Inverter clock verified; old=%ld new=%ld UTC offset=%ld",
+       (long)*beforeTime, (long)*afterTime, (long)verifiedOffset);
+  return E_OK;
+}
+
 // **** Logon SMA **********
 E_RC ESP32_SMA_Inverter::logonSMAInverter(const char *password, const uint8_t user) {
   //extern uint8_t sixff[6];

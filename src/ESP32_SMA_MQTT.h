@@ -45,6 +45,7 @@ public:
      void wifiLoop();
      void formPage ();
      void handleForm();
+     void handleSetClock();
      bool brokerConnect();
      bool publishData();
      bool publishEspStatus();
@@ -67,6 +68,7 @@ private:
     bool discoveryPublishOK = true;
     bool espDiscoveryPublished = false;
     unsigned long lastEspStatusMillis = 0;
+    String clockSyncToken;
     // Private constructor to prevent instantiation from outside the class.
     ESP32_SMA_MQTT() : ESP32Loggable("ESP32_SMA_MQTT") {
          initMap();
@@ -129,6 +131,7 @@ private:
 extern void E_formPage();
 extern void E_connectAP();
 extern void E_handleForm();
+extern void E_handleSetClock();
 
 
 #endif

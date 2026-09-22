@@ -69,6 +69,10 @@ extern void E_handleForm() {
   ESP32_SMA_MQTT::getInstance().handleForm();
 }
 
+extern void E_handleSetClock() {
+  ESP32_SMA_MQTT::getInstance().handleSetClock();
+}
+
 void ESP32_SMA_MQTT::wifiTime() {
   AppConfig& config = ESP32_SMA_Inverter_App::getInstance().appConfig;
 
@@ -107,6 +111,9 @@ void ESP32_SMA_MQTT::wifiStartup(){
   char sapString[20]="";
   snprintf(sapString, 20, "SMA-%08X", ESP.getEfuseMac());
   mqttInstance.sapString = String(sapString);
+  char token[17];
+  snprintf(token, sizeof(token), "%08lX%08lX", (unsigned long)esp_random(), (unsigned long)esp_random());
+  clockSyncToken = String(token);
   logD("%s", mqttInstance.sapString.c_str());
 
   // Attempt to connect to the AP stored on board, if not, start in SoftAP mode
@@ -169,10 +176,11 @@ void ESP32_SMA_MQTT::wifiStartup(){
   wifiTime();
 
 
-  ESP32_SMA_Inverter_App::webServer.begin();
   ESP32_SMA_Inverter_App::webServer.on("/", E_formPage);
   ESP32_SMA_Inverter_App::webServer.on("/smartconfig", E_connectAP);
   ESP32_SMA_Inverter_App::webServer.on("/postform/", E_handleForm);
+  ESP32_SMA_Inverter_App::webServer.on("/setclock/", HTTP_POST, E_handleSetClock);
+  ESP32_SMA_Inverter_App::webServer.begin();
 
   logI("Web Server Running: ");
 
@@ -311,6 +319,17 @@ table, th, td {\
   strcat(responseHTML, "</TABLE>");
   strcat(responseHTML, "<input type=\"submit\" value=\"Submit\"></form><BR> <A href=\"/smartconfig\">Enable ESP Touch App smart config</A><BR>");
 
+  String clockStatus = htmlEscape(ESP32_SMA_Inverter_App::getInstance().getClockSyncStatus());
+  String espTime = htmlEscape(getTime());
+  snprintf(tempstr, sizeof(tempstr),
+    "<H2>Inverter clock</H2><P>ESP time: %s (configured UTC offset: %.2f hours)</P>"
+    "<P>Last clock action: %s</P>"
+    "<form method=\"post\" action=\"/setclock/\" onsubmit=\"return confirm('Set the inverter clock from the displayed ESP time now?');\">"
+    "<input type=\"hidden\" name=\"token\" value=\"%s\">"
+    "<input type=\"submit\" value=\"Set inverter clock from NTP\"></form><BR>",
+    espTime.c_str(), config.timezone, clockStatus.c_str(), clockSyncToken.c_str());
+  strcat(responseHTML, tempstr);
+
 
   strcat(responseHTML, "<TABLE><TR><TH>Last Scan</TH><TH>Data</TH>\n");
 
@@ -349,6 +368,20 @@ table, th, td {\
   ESP32_SMA_Inverter_App::webServer.send(200, "text/html", responseHTML);
 
   free(responseHTML);
+}
+
+void ESP32_SMA_MQTT::handleSetClock() {
+  if (!requireWebAuthentication()) return;
+  if (!ESP32_SMA_Inverter_App::webServer.hasArg("token") ||
+      ESP32_SMA_Inverter_App::webServer.arg("token") != clockSyncToken) {
+    ESP32_SMA_Inverter_App::webServer.send(403, "text/plain", "Invalid or expired request token");
+    return;
+  }
+
+  ESP32_SMA_Inverter_App::getInstance().requestClockSync();
+  String response = ESP32_SMA_Inverter_App::getInstance().getClockSyncStatus();
+  response += "\n\nReturn to the main page to check the verified result.";
+  ESP32_SMA_Inverter_App::webServer.send(202, "text/plain", response);
 }
 
 // Function to extract the configuration

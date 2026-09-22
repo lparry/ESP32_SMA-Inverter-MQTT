@@ -37,6 +37,16 @@ WebServer ESP32_SMA_Inverter_App::webServer(80);
 
 int ESP32_SMA_Inverter_App::smartConfig = 0;
 
+static String formatLocalEpoch(int32_t epoch) {
+  if (epoch <= 0) return String("unknown");
+  time_t value = (time_t)epoch;
+  struct tm localValue;
+  localtime_r(&value, &localValue);
+  char formatted[32];
+  strftime(formatted, sizeof(formatted), "%Y-%m-%d %H:%M:%S", &localValue);
+  return String(formatted);
+}
+
 void setup() { 
 
   Logging::setLevel(esp32m::Info);
@@ -100,6 +110,11 @@ void ESP32_SMA_Inverter_App::appLoop() {
   DisplayData& dispData = ESP32_SMA_Inverter::getInstance().dispData;
   bool ntpWorking = getLocalTime(&timeinfo);
 
+  if (clockSyncRequested && (int32_t)(millis() - clockSyncRequestDeadline) >= 0) {
+    clockSyncRequested = false;
+    clockSyncStatus = "Request expired before an inverter connection was available";
+  }
+
 // Check if the Sun is up or the grid relay is closed
   if ((ntpWorking && (timeinfo.tm_hour >= SUNUP) && (timeinfo.tm_hour <= SUNDOWN)) || (invData.GridRelay == 51)){
     nightTime = false;
@@ -138,6 +153,20 @@ void ESP32_SMA_Inverter_App::appLoop() {
       if (rc == E_OK) {
         rc = smaInverter.logonSMAInverter(smaInvPass, USERGROUP);
         logI("Logon return code %d\n",rc);
+      }
+      if (rc == E_OK && clockSyncRequested) {
+        // Clear before attempting: every button press permits exactly one write attempt.
+        clockSyncRequested = false;
+        int32_t beforeTime = 0;
+        int32_t afterTime = 0;
+        int32_t utcOffsetSeconds = (int32_t)lroundf(appConfig.timezone * 3600.0f);
+        E_RC clockRc = smaInverter.syncPlantTime(utcOffsetSeconds, &beforeTime, &afterTime);
+        if (clockRc == E_OK) {
+          clockSyncStatus = "Verified: " + formatLocalEpoch(beforeTime) + " -> " + formatLocalEpoch(afterTime);
+        } else {
+          clockSyncStatus = "Clock sync failed with code " + String((int)clockRc) + "; no automatic retry";
+          logW("Clock sync failed (%d)", clockRc);
+        }
       }
       if (rc == E_OK) {
         InverterData previousInvData = invData;
@@ -207,6 +236,19 @@ void ESP32_SMA_Inverter_App::appLoop() {
 
     
   delay(100);
+}
+
+void ESP32_SMA_Inverter_App::requestClockSync() {
+  time_t now = time(nullptr);
+  if (now < 1700000000) {
+    clockSyncRequested = false;
+    clockSyncStatus = "Rejected: ESP NTP time is not valid";
+    return;
+  }
+  clockSyncRequested = true;
+  clockSyncRequestDeadline = millis() + 5UL * 60UL * 1000UL;
+  nextTime = millis();
+  clockSyncStatus = "Queued for the next inverter connection; expires in five minutes";
 }
 
 
