@@ -33,8 +33,8 @@ The inverter is added as a device, while all the inverter parameters are defined
   - Entity label: sma_21005XXXXX_grid_relay_status
 
 The ESP32 also publishes its own diagnostics every 60 seconds, even while the inverter is asleep.
-Its state topic is `sma/solar/SMA-XXXXXXXX/esp/state` and contains `IP`, `Time` (UTC ISO 8601,
-only after the ESP clock is valid), `WiFiRSSI` (dBm), `Uptime` (seconds), and `FreeHeap` (bytes).
+Its state topic is `sma/solar/SMA-XXXXXXXX/esp/state` and contains `IP`, `WiFiRSSI`
+(dBm), `Uptime` (seconds), and `FreeHeap` (bytes).
 With Home Assistant discovery enabled, these appear as diagnostic sensors on the inverter
 device, including its ESP32 IP address and a link to the web UI. Sensor states expire after
 180 seconds if the ESP stops publishing. MQTT state messages are not retained. The status

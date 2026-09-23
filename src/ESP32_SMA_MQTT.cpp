@@ -479,7 +479,6 @@ bool ESP32_SMA_MQTT::publishEspDiscovery(const char *stateTopic) {
   };
   const Sensor sensors[] = {
     {"ip", "IP address", "IP", nullptr, nullptr},
-    {"time", "Current time", "Time", "timestamp", nullptr},
     {"wifi_rssi", "Wi-Fi signal", "WiFiRSSI", "signal_strength", "dBm"},
     {"uptime", "Uptime", "Uptime", "duration", "s"},
     {"free_heap", "Free heap", "FreeHeap", "data_size", "B"},
@@ -489,6 +488,15 @@ bool ESP32_SMA_MQTT::publishEspDiscovery(const char *stateTopic) {
   const uint32_t serial = invData.Serial != 0 ? invData.Serial : config.thisSerial;
   if (serial == 0) return false;
   const String inverterId = config.mqttTopic + "-" + String(serial);
+  // Clear the retired clock sensor from both discovery layouts.
+  char oldTimeTopic[128];
+  char inverterTimeTopic[128];
+  snprintf(oldTimeTopic, sizeof(oldTimeTopic),
+           "homeassistant/sensor/%s/esp_time/config", sapString.c_str());
+  snprintf(inverterTimeTopic, sizeof(inverterTimeTopic),
+           "homeassistant/sensor/%s/esp_time/config", inverterId.c_str());
+  if (!ESP32_SMA_Inverter_App::client.publish(oldTimeTopic, "", true) ||
+      !ESP32_SMA_Inverter_App::client.publish(inverterTimeTopic, "", true)) return false;
   // Retained configs from older firmware keep the separate ESP32 device alive.
   // Remove them before publishing the same entities under the inverter device.
   for (const Sensor& sensor : sensors) {
@@ -554,15 +562,6 @@ bool ESP32_SMA_MQTT::publishEspStatus() {
   status["WiFiRSSI"] = WiFi.RSSI();
   status["Uptime"] = (uint64_t)(esp_timer_get_time() / 1000000LL);
   status["FreeHeap"] = ESP.getFreeHeap();
-  time_t now = time(nullptr);
-  if (now >= 1700000000) {
-    struct tm utc;
-    gmtime_r(&now, &utc);
-    char timestamp[25];
-    if (strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &utc)) {
-      status["Time"] = timestamp;
-    }
-  }
   char payload[256];
   size_t length = serializeJson(status, payload, sizeof(payload));
   return length > 0 && ESP32_SMA_Inverter_App::client.publish(
