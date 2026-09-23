@@ -41,6 +41,7 @@ public:
      void wifiStartup();
      void wifiTime();
      void mySmartConfig();
+     void showSmartConfigConfirmation();
      void connectAP();
      void wifiLoop();
      void formPage ();
@@ -70,6 +71,7 @@ private:
     uint32_t espDiscoveredSerial = 0;
     unsigned long lastEspStatusMillis = 0;
     String clockSyncToken;
+    String smartConfigToken;
     // Private constructor to prevent instantiation from outside the class.
     ESP32_SMA_MQTT() : ESP32Loggable("ESP32_SMA_MQTT") {
          initMap();
@@ -131,6 +133,7 @@ private:
 
 extern void E_formPage();
 extern void E_connectAP();
+extern void E_showSmartConfigConfirmation();
 extern void E_handleForm();
 extern void E_handleSetClock();
 

@@ -65,6 +65,10 @@ extern void E_connectAP() {
   ESP32_SMA_MQTT::getInstance().connectAP();
 }
 
+extern void E_showSmartConfigConfirmation() {
+  ESP32_SMA_MQTT::getInstance().showSmartConfigConfirmation();
+}
+
 extern void E_handleForm() {
   ESP32_SMA_MQTT::getInstance().handleForm();
 }
@@ -114,6 +118,8 @@ void ESP32_SMA_MQTT::wifiStartup(){
   char token[17];
   snprintf(token, sizeof(token), "%08lX%08lX", (unsigned long)esp_random(), (unsigned long)esp_random());
   clockSyncToken = String(token);
+  snprintf(token, sizeof(token), "%08lX%08lX", (unsigned long)esp_random(), (unsigned long)esp_random());
+  smartConfigToken = String(token);
   logD("%s", mqttInstance.sapString.c_str());
 
   // Attempt to connect to the AP stored on board, if not, start in SoftAP mode
@@ -177,7 +183,8 @@ void ESP32_SMA_MQTT::wifiStartup(){
 
 
   ESP32_SMA_Inverter_App::webServer.on("/", E_formPage);
-  ESP32_SMA_Inverter_App::webServer.on("/smartconfig", E_connectAP);
+  ESP32_SMA_Inverter_App::webServer.on("/smartconfig", HTTP_GET, E_showSmartConfigConfirmation);
+  ESP32_SMA_Inverter_App::webServer.on("/smartconfig", HTTP_POST, E_connectAP);
   ESP32_SMA_Inverter_App::webServer.on("/postform/", E_handleForm);
   ESP32_SMA_Inverter_App::webServer.on("/setclock/", HTTP_POST, E_handleSetClock);
   ESP32_SMA_Inverter_App::webServer.begin();
@@ -199,7 +206,7 @@ void ESP32_SMA_MQTT::mySmartConfig() {
 
   //Wait for SmartConfig packet from mobile
   logI("Waiting for SmartESP32_SMA_Inverter_App_Config::config");
-  // if no smartconfig received after 5 minutes, reboot and try again
+  // If no SmartConfig message arrives after about 8 minutes, reboot and try again.
   int count = 0;
   while (!WiFi.smartConfigDone()) {
     delay(2000);
@@ -224,10 +231,36 @@ void ESP32_SMA_MQTT::mySmartConfig() {
   ESP.restart();
 }
 
-// Use ESP SmartConfig to connect to wifi
+void ESP32_SMA_MQTT::showSmartConfigConfirmation() {
+  if (!requireWebAuthentication()) return;
+  String page =
+    "<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+    "<title>Change ESP32 Wi-Fi network</title></head><body>"
+    "<h1>Change ESP32 Wi-Fi network</h1>"
+    "<p>This starts ESPTouch setup so a phone can send new Wi-Fi credentials to the ESP32. "
+    "Use it only if you want to move the ESP32 to another Wi-Fi network.</p>"
+    "<p>You need the ESPTouch app on a phone connected to the new network. "
+    "Once started, inverter polling and MQTT updates pause, and this page may stop responding. "
+    "The ESP32 restarts after receiving the new settings or after about 8 minutes without them.</p>"
+    "<form method=\"post\" action=\"/smartconfig\">"
+    "<input type=\"hidden\" name=\"token\" value=\"" + smartConfigToken + "\">"
+    "<button type=\"submit\">Start Wi-Fi setup</button></form>"
+    "<p><a href=\"/\">Cancel and return to inverter page</a></p></body></html>";
+  ESP32_SMA_Inverter_App::webServer.sendHeader("Cache-Control", "no-store");
+  ESP32_SMA_Inverter_App::webServer.send(200, "text/html", page);
+}
+
+// Use ESP SmartConfig to connect to Wi-Fi only after the confirmation form is submitted.
 void ESP32_SMA_MQTT::connectAP(){
   if (!requireWebAuthentication()) return;
-  ESP32_SMA_Inverter_App::webServer.send(200, "text/plain", "Open ESPTouch: Smartconfig App to connect to Wifi Network");
+  if (!ESP32_SMA_Inverter_App::webServer.hasArg("token") ||
+      ESP32_SMA_Inverter_App::webServer.arg("token") != smartConfigToken) {
+    ESP32_SMA_Inverter_App::webServer.send(403, "text/plain", "Invalid or expired request token");
+    return;
+  }
+  ESP32_SMA_Inverter_App::webServer.send(200, "text/plain",
+      "Wi-Fi setup started. Open the ESPTouch app on a phone connected to the new Wi-Fi network. "
+      "Inverter and MQTT updates are paused until the ESP32 restarts.");
   delay(2000);
   mySmartConfig();
 
@@ -316,7 +349,7 @@ table, th, td {\
     snprintf(fulltopic,sizeof(fulltopic),"%s-%lu/state",config.mqttTopic.c_str(),(unsigned long)config.thisSerial);
   }
   strcat(responseHTML, "</TABLE>");
-  strcat(responseHTML, "<input type=\"submit\" value=\"Submit\"></form><BR> <A href=\"/smartconfig\">Enable ESP Touch App smart config</A><BR>");
+  strcat(responseHTML, "<input type=\"submit\" value=\"Submit\"></form><BR> <A href=\"/smartconfig\">Change ESP32 Wi-Fi network (review before starting)</A><BR>");
 
   String clockStatus = htmlEscape(ESP32_SMA_Inverter_App::getInstance().getClockSyncStatus());
   String espTime = htmlEscape(getTime());
