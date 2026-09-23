@@ -47,6 +47,7 @@ public:
      void handleForm();
      bool brokerConnect();
      bool publishData();
+     bool publishEspStatus();
      bool hassAutoDiscover(int timeout);
      bool sendLongMQTT(const char *topic, const char *postscript, const char *msg);
      void logViaMQTT(const char *logStr);
@@ -64,6 +65,8 @@ private:
     uint64_t lastAcceptedETotalWh = 0;
     uint64_t lastPersistedETotalWh = 0;
     bool discoveryPublishOK = true;
+    bool espDiscoveryPublished = false;
+    unsigned long lastEspStatusMillis = 0;
     // Private constructor to prevent instantiation from outside the class.
     ESP32_SMA_MQTT() : ESP32Loggable("ESP32_SMA_MQTT") {
          initMap();
@@ -110,6 +113,7 @@ private:
 
 
     void sendSensorValue(char *tmpstr, const char *topic, const int timeout);
+    bool publishEspDiscovery(const char *stateTopic);
 
     void sendHassAuto(char *msg, size_t msg_size, int timeout, const char *topic, const char *devclass, const char *stateclass, const char *forceupdate,
                                       const char *devname, const char *unitOf, const char *sensortype,

@@ -23,6 +23,7 @@ SOFTWARE.
 // Wifi Functions choose between Station or SoftAP
 
 #include "ESP32_SMA_MQTT.h"
+#include <esp_timer.h>
 
 #define FORMAT_LITTLEFS_IF_FAILED
 
@@ -236,8 +237,11 @@ void ESP32_SMA_MQTT::wifiLoop(){
     mqttInstance.previousMillis = currentMillis;
   }
 
-  if (WiFi.status() == WL_CONNECTED && ESP32_SMA_Inverter_App::client.connected()) {
-    ESP32_SMA_Inverter_App::client.loop();
+  if (WiFi.status() == WL_CONNECTED) {
+    publishEspStatus();
+    if (ESP32_SMA_Inverter_App::client.connected()) {
+      ESP32_SMA_Inverter_App::client.loop();
+    }
   }
 
   ESP32_SMA_Inverter_App::webServer.handleClient();
@@ -414,6 +418,7 @@ bool ESP32_SMA_MQTT::brokerConnect() {
 
   // client.setCallback(callback);
   if (!ESP32_SMA_Inverter_App::client.connected()) {
+      espDiscoveryPublished = false;
       logW("The client %s connects to the mqtt broker %s ", mqttInstance.sapString.c_str(), config.mqttBroker.c_str());
       // If there is a user account
       if(config.mqttUser.length() > 0){
@@ -429,6 +434,89 @@ bool ESP32_SMA_MQTT::brokerConnect() {
       }
     }
   return ESP32_SMA_Inverter_App::client.connected();
+}
+
+// ESP status is published independently of inverter polling, including at night.
+bool ESP32_SMA_MQTT::publishEspDiscovery(const char *stateTopic) {
+  struct Sensor {
+    const char *id;
+    const char *name;
+    const char *field;
+    const char *deviceClass;
+    const char *unit;
+  };
+  const Sensor sensors[] = {
+    {"ip", "IP address", "IP", nullptr, nullptr},
+    {"time", "Current time", "Time", "timestamp", nullptr},
+    {"wifi_rssi", "Wi-Fi signal", "WiFiRSSI", "signal_strength", "dBm"},
+    {"uptime", "Uptime", "Uptime", "duration", "s"},
+    {"free_heap", "Free heap", "FreeHeap", "data_size", "B"},
+  };
+  bool success = true;
+  for (const Sensor& sensor : sensors) {
+    char discoveryTopic[128];
+    snprintf(discoveryTopic, sizeof(discoveryTopic),
+             "homeassistant/sensor/%s/esp_%s/config", sapString.c_str(), sensor.id);
+    StaticJsonDocument<512> discovery;
+    discovery["name"] = sensor.name;
+    discovery["state_topic"] = stateTopic;
+    discovery["value_template"] = String("{{ value_json.") + sensor.field + " }}";
+    discovery["unique_id"] = sapString + "-esp-" + sensor.id;
+    discovery["entity_category"] = "diagnostic";
+    discovery["expire_after"] = 180;
+    if (sensor.deviceClass) discovery["device_class"] = sensor.deviceClass;
+    if (sensor.unit) discovery["unit_of_measurement"] = sensor.unit;
+    JsonObject device = discovery.createNestedObject("device");
+    device.createNestedArray("identifiers").add(sapString + "-esp");
+    device["name"] = sapString + " ESP32";
+    device["manufacturer"] = "Espressif";
+    char payload[512];
+    size_t length = measureJson(discovery);
+    if (discovery.overflowed() || length >= sizeof(payload)) {
+      success = false;
+      continue;
+    }
+    serializeJson(discovery, payload, sizeof(payload));
+    if (!ESP32_SMA_Inverter_App::client.publish(discoveryTopic, payload, true)) {
+      success = false;
+    }
+  }
+  return success;
+}
+
+bool ESP32_SMA_MQTT::publishEspStatus() {
+  AppConfig& config = ESP32_SMA_Inverter_App::getInstance().appConfig;
+  if (config.mqttBroker.isEmpty() || WiFi.status() != WL_CONNECTED) return false;
+
+  const unsigned long nowMillis = millis();
+  if (lastEspStatusMillis != 0 && nowMillis - lastEspStatusMillis < 60000UL) return true;
+  lastEspStatusMillis = nowMillis;
+  if (!brokerConnect()) return false;
+
+  char stateTopic[96];
+  snprintf(stateTopic, sizeof(stateTopic), "sma/solar/%s/esp/state", sapString.c_str());
+  if (config.hassDisc && !espDiscoveryPublished) {
+    espDiscoveryPublished = publishEspDiscovery(stateTopic);
+  }
+
+  StaticJsonDocument<256> status;
+  status["IP"] = WiFi.localIP().toString();
+  status["WiFiRSSI"] = WiFi.RSSI();
+  status["Uptime"] = (uint64_t)(esp_timer_get_time() / 1000000LL);
+  status["FreeHeap"] = ESP.getFreeHeap();
+  time_t now = time(nullptr);
+  if (now >= 1700000000) {
+    struct tm utc;
+    gmtime_r(&now, &utc);
+    char timestamp[25];
+    if (strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &utc)) {
+      status["Time"] = timestamp;
+    }
+  }
+  char payload[256];
+  size_t length = serializeJson(status, payload, sizeof(payload));
+  return length > 0 && ESP32_SMA_Inverter_App::client.publish(
+      stateTopic, reinterpret_cast<const uint8_t*>(payload), length, false);
 }
 
 // Returns true if nighttime
