@@ -67,6 +67,7 @@ private:
     uint64_t lastPersistedETotalWh = 0;
     bool discoveryPublishOK = true;
     bool espDiscoveryPublished = false;
+    uint32_t espDiscoveredSerial = 0;
     unsigned long lastEspStatusMillis = 0;
     String clockSyncToken;
     // Private constructor to prevent instantiation from outside the class.

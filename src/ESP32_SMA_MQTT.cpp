@@ -256,7 +256,6 @@ void ESP32_SMA_MQTT::wifiLoop(){
 }
 
 void ESP32_SMA_MQTT::formPage () {
-  if (!requireWebAuthentication()) return;
   char tempstr[2048];
   char *responseHTML;
   InverterData& invData = ESP32_SMA_Inverter::getInstance().invData;
@@ -485,11 +484,24 @@ bool ESP32_SMA_MQTT::publishEspDiscovery(const char *stateTopic) {
     {"uptime", "Uptime", "Uptime", "duration", "s"},
     {"free_heap", "Free heap", "FreeHeap", "data_size", "B"},
   };
+  AppConfig& config = ESP32_SMA_Inverter_App::getInstance().appConfig;
+  InverterData& invData = ESP32_SMA_Inverter::getInstance().invData;
+  const uint32_t serial = invData.Serial != 0 ? invData.Serial : config.thisSerial;
+  if (serial == 0) return false;
+  const String inverterId = config.mqttTopic + "-" + String(serial);
+  // Retained configs from older firmware keep the separate ESP32 device alive.
+  // Remove them before publishing the same entities under the inverter device.
+  for (const Sensor& sensor : sensors) {
+    char oldTopic[128];
+    snprintf(oldTopic, sizeof(oldTopic),
+             "homeassistant/sensor/%s/esp_%s/config", sapString.c_str(), sensor.id);
+    if (!ESP32_SMA_Inverter_App::client.publish(oldTopic, "", true)) return false;
+  }
   bool success = true;
   for (const Sensor& sensor : sensors) {
     char discoveryTopic[128];
     snprintf(discoveryTopic, sizeof(discoveryTopic),
-             "homeassistant/sensor/%s/esp_%s/config", sapString.c_str(), sensor.id);
+             "homeassistant/sensor/%s/esp_%s/config", inverterId.c_str(), sensor.id);
     StaticJsonDocument<512> discovery;
     discovery["name"] = sensor.name;
     discovery["state_topic"] = stateTopic;
@@ -500,9 +512,10 @@ bool ESP32_SMA_MQTT::publishEspDiscovery(const char *stateTopic) {
     if (sensor.deviceClass) discovery["device_class"] = sensor.deviceClass;
     if (sensor.unit) discovery["unit_of_measurement"] = sensor.unit;
     JsonObject device = discovery.createNestedObject("device");
-    device.createNestedArray("identifiers").add(sapString + "-esp");
-    device["name"] = sapString + " ESP32";
-    device["manufacturer"] = "Espressif";
+    device.createNestedArray("identifiers").add(inverterId);
+    device["name"] = inverterId;
+    device["manufacturer"] = "SMA";
+    device["configuration_url"] = String("http://") + WiFi.localIP().toString() + "/";
     char payload[512];
     size_t length = measureJson(discovery);
     if (discovery.overflowed() || length >= sizeof(payload)) {
@@ -528,8 +541,12 @@ bool ESP32_SMA_MQTT::publishEspStatus() {
 
   char stateTopic[96];
   snprintf(stateTopic, sizeof(stateTopic), "sma/solar/%s/esp/state", sapString.c_str());
-  if (config.hassDisc && !espDiscoveryPublished) {
+  InverterData& invData = ESP32_SMA_Inverter::getInstance().invData;
+  const uint32_t serial = invData.Serial != 0 ? invData.Serial : config.thisSerial;
+  if (config.hassDisc && serial != 0 &&
+      (!espDiscoveryPublished || espDiscoveredSerial != serial)) {
     espDiscoveryPublished = publishEspDiscovery(stateTopic);
+    if (espDiscoveryPublished) espDiscoveredSerial = serial;
   }
 
   StaticJsonDocument<256> status;
@@ -711,6 +728,7 @@ bool ESP32_SMA_MQTT::hassAutoDiscover(int timeout){
     sendHassAutoNoClassNoUnit(msg, msg_size, timeout, topic, "Device Status", "DevStatus", "DevStatus");
     sendHassAutoNoClassNoUnit(msg, msg_size, timeout, topic, "Grid Relay Status", "GridRelay", "GridRelay");
     sendHassAutoNoClass(msg, msg_size, timeout, topic, "Bluetooth", "%", "BTStrength", "BTStrength");
+
     return discoveryPublishOK && ESP32_SMA_Inverter_App::client.connected();
 }
 
