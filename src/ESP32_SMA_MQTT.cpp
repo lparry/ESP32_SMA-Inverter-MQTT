@@ -684,7 +684,9 @@ bool ESP32_SMA_MQTT::hassAutoDiscover(int timeout){
   if (!brokerConnect()) return false;
   discoveryPublishOK = true;
 
-  snprintf(topic,sizeof(topic)-1, "%s-%d",config.mqttTopic.c_str(), invData.Serial);
+  const uint32_t serial = invData.Serial != 0 ? invData.Serial : config.thisSerial;
+  if (serial == 0) return false;
+  snprintf(topic,sizeof(topic), "%s-%lu", config.mqttTopic.c_str(), (unsigned long)serial);
   const size_t msg_size = sizeof(msg);
 
     sendHassAuto(msg, msg_size, timeout, topic, "power", "measurement", "true", "AC Power", "W", "Pac", "Pac");

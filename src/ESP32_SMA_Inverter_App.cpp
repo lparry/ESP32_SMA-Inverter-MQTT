@@ -116,7 +116,7 @@ void ESP32_SMA_Inverter_App::appLoop() {
   }
 
 // Check if the Sun is up or the grid relay is closed
-  if ((ntpWorking && (timeinfo.tm_hour >= SUNUP) && (timeinfo.tm_hour <= SUNDOWN)) || (invData.GridRelay == 51)){
+  if ((ntpWorking && (timeinfo.tm_hour >= SUNUP) && (timeinfo.tm_hour < SUNDOWN)) || (invData.GridRelay == 51)){
     nightTime = false;
     adjustedScanRate = constrain(appConfig.scanRate, 10, 3600) * 1000;
   } else {
@@ -188,27 +188,6 @@ void ESP32_SMA_Inverter_App::appLoop() {
 #endif
       
       smaInverter.disconnect(); //moved btConnected to inverter class
-      //Send Home Assistant autodiscover
-      if(freshData && appConfig.mqttBroker.length() > 0 && appConfig.hassDisc ) {
-        if(firstTime){
-          int expiry = nightTime ? 1800 : constrain(appConfig.scanRate, 10, 3600) * 2;
-          if (mqttInstanceForApp.hassAutoDiscover(expiry)) {
-            mqttInstanceForApp.logViaMQTT("First boot");
-            firstTime=false;
-            dayNight = nightTime;
-          }
-        } else if( nightTime != dayNight ) {
-          if (nightTime) { // Change the expire time in home Assistant
-            mqttInstanceForApp.hassAutoDiscover(1800);
-            mqttInstanceForApp.logViaMQTT("Night Time");
-          } else {
-            mqttInstanceForApp.hassAutoDiscover(appConfig.scanRate *2);
-            mqttInstanceForApp.logViaMQTT("Day Time");
-          }
-          dayNight = nightTime;
-        }
-      }
-
 //       mqttInstanceForApp.publishData();
       failCount=0;
     } else { 
@@ -222,14 +201,34 @@ void ESP32_SMA_Inverter_App::appLoop() {
         }
       }
     } 
-    if (freshData) {
-      mqttInstanceForApp.publishData();
-    }
   }
   
   if (invData.Serial != 0 && appConfig.thisSerial != invData.Serial) {
     appConfig.thisSerial = invData.Serial;
     ESP32_SMA_Inverter_App::getInstance().saveConfiguration();
+  }
+  // Discovery carries the sensor expiry. Update it when the polling mode changes,
+  // even if the inverter has gone to sleep and no new reading can be published.
+  const uint32_t currentSerial = invData.Serial != 0 ? invData.Serial : appConfig.thisSerial;
+  if (appConfig.hassDisc && appConfig.mqttBroker.length() > 0 &&
+      currentSerial != 0 &&
+      (firstTime || nightTime != dayNight || currentSerial != discoveredSerial) &&
+      (int32_t)(millis() - nextDiscoveryAttempt) >= 0) {
+    const int expiry = nightTime
+        ? max(2700, (NIGHTSCANRATE / 1000) * 3)
+        : max(300, constrain(appConfig.scanRate, 10, 3600) * 3 + 60);
+    nextDiscoveryAttempt = millis() + 60000UL;
+    if (mqttInstanceForApp.hassAutoDiscover(expiry)) {
+      if (firstTime) mqttInstanceForApp.logViaMQTT("First boot");
+      else mqttInstanceForApp.logViaMQTT(nightTime ? "Night Time" : "Day Time");
+      firstTime = false;
+      dayNight = nightTime;
+      discoveredSerial = currentSerial;
+    }
+  }
+  // Publish the fresh, non-retained reading after Home Assistant has its discovery config.
+  if (freshData) {
+    mqttInstanceForApp.publishData();
   }
   // DEBUG1_PRINT(".");
   mqttInstanceForApp.wifiLoop();

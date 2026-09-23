@@ -101,6 +101,8 @@ class ESP32_SMA_Inverter_App : public ESP32Loggable {
         bool nightTime = false;
         bool firstTime = true;
         bool dayNight = false;
+        uint32_t nextDiscoveryAttempt = 0;
+        uint32_t discoveredSerial = 0;
 
     private: 
         ESP32_SMA_Inverter_App() :  ESP32Loggable("ESP32_SMA_Inverter_App") {
