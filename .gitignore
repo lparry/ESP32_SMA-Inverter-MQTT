@@ -5,3 +5,5 @@
 .vscode/ipch
 src/Config.h
 src/config_values.h
+
+.DS_Store

@@ -256,6 +256,7 @@ class ESP32_SMA_Inverter : public ESP32Loggable {
     E_RC initialiseSMAConnection();
     E_RC logonSMAInverter(const char *password, const uint8_t user);
     void logoffSMAInverter();
+    E_RC syncPlantTime(int32_t utcOffsetSeconds, int32_t *beforeTime, int32_t *afterTime);
 
     E_RC ArchiveDayData(time_t startTime);
     E_RC ReadCurrentData();
@@ -312,16 +313,13 @@ class ESP32_SMA_Inverter : public ESP32Loggable {
 
     BluetoothSerial serialBT = BluetoothSerial();
 
-    uint8_t  btrdBuf[256];    
+    uint8_t  btrdBuf[COMMBUFSIZE];
     uint16_t pcktBufMax = 0; // max. used size of PcktBuf
     uint8_t  espBTAddress[6]; // is retrieved from BT packet
 
     bool btConnected = false;
 
     char timeBuf[24];
-    char charBuf[CHAR_BUF_MAX];
-    int  charLen = 0;
-
   //from SMA_Bluetooth
         uint8_t  pcktBuf[MAX_PCKT_BUF_SIZE];
         uint16_t pcktBufPos = 0;
@@ -330,6 +328,9 @@ class ESP32_SMA_Inverter : public ESP32Loggable {
         uint16_t fcsChecksum=0xffff;
         uint8_t sixzeros[6]= {0x00,0x00,0x00,0x00,0x00,0x00};
         uint8_t sixff[6]   = {0xff,0xff,0xff,0xff,0xff,0xff};
+
+        E_RC readPlantTime(int32_t *currentTime, int32_t *lastTimeSet,
+                           int32_t *utcOffsetSeconds, uint32_t *setCount);
 
         PROGMEM prog_uint16_t  fcstab[256]  = {
         0x0000, 0x1189, 0x2312, 0x329b, 0x4624, 0x57ad, 0x6536, 0x74bf,0x8c48, 0x9dc1, 0xaf5a, 0xbed3, 0xca6c, 0xdbe5, 0xe97e, 0xf8f7,

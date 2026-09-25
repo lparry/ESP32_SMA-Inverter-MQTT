@@ -37,6 +37,16 @@ WebServer ESP32_SMA_Inverter_App::webServer(80);
 
 int ESP32_SMA_Inverter_App::smartConfig = 0;
 
+static String formatLocalEpoch(int32_t epoch) {
+  if (epoch <= 0) return String("unknown");
+  time_t value = (time_t)epoch;
+  struct tm localValue;
+  localtime_r(&value, &localValue);
+  char formatted[32];
+  strftime(formatted, sizeof(formatted), "%Y-%m-%d %H:%M:%S", &localValue);
+  return String(formatted);
+}
+
 void setup() { 
 
   Logging::setLevel(esp32m::Info);
@@ -97,18 +107,25 @@ void ESP32_SMA_Inverter_App::appLoop() {
   int adjustedScanRate;
   struct tm timeinfo;
   InverterData& invData = ESP32_SMA_Inverter::getInstance().invData;
+  DisplayData& dispData = ESP32_SMA_Inverter::getInstance().dispData;
   bool ntpWorking = getLocalTime(&timeinfo);
 
+  if (clockSyncRequested && (int32_t)(millis() - clockSyncRequestDeadline) >= 0) {
+    clockSyncRequested = false;
+    clockSyncStatus = "Request expired before an inverter connection was available";
+  }
+
 // Check if the Sun is up or the grid relay is closed
-  if ((ntpWorking && (timeinfo.tm_hour >= SUNUP) && (timeinfo.tm_hour <= SUNDOWN)) || (invData.GridRelay == 51)){
+  if ((ntpWorking && (timeinfo.tm_hour >= SUNUP) && (timeinfo.tm_hour < SUNDOWN)) || (invData.GridRelay == 51)){
     nightTime = false;
-    adjustedScanRate = (appConfig.scanRate * 1000);
+    adjustedScanRate = constrain(appConfig.scanRate, 10, 3600) * 1000;
   } else {
     nightTime = true;
     adjustedScanRate = NIGHTSCANRATE;
   }
   // connect or reconnect after connection lost 
-  if ( !smartConfig && (nextTime < millis()) && (!smaInverter.isBtConnected())) {
+  bool freshData = false;
+  if (!smartConfig && ((int32_t)(millis() - nextTime) >= 0) && (!smaInverter.isBtConnected())) {
     nextTime = millis() + adjustedScanRate;
     if(nightTime)
       logW("Night time - 15min scans\n");
@@ -123,44 +140,54 @@ void ESP32_SMA_Inverter_App::appLoop() {
       logW("BT connected \n");
       E_RC rc = smaInverter.initialiseSMAConnection();
       logI("SMA %d \n",rc);
-      smaInverter.getBT_SignalStrength();
+      if (rc == E_OK) {
+        smaInverter.getBT_SignalStrength();
+      }
 
 #ifdef LOGOFF
       // not sure the purpose but SBfSpot code logs off before logging on and this has proved very reliable for me: mrtoy-me 
-      logoffSMAInverter();
+      smaInverter.logoffSMAInverter();
 #endif
       // **** logon SMA ************
       logW("*** logonSMAInverter\n");
-      rc = smaInverter.logonSMAInverter(smaInvPass, USERGROUP);
-      logI("Logon return code %d\n",rc);
-      smaInverter.ReadCurrentData();
+      if (rc == E_OK) {
+        rc = smaInverter.logonSMAInverter(smaInvPass, USERGROUP);
+        logI("Logon return code %d\n",rc);
+      }
+      if (rc == E_OK && clockSyncRequested) {
+        // Clear before attempting: every button press permits exactly one write attempt.
+        clockSyncRequested = false;
+        int32_t beforeTime = 0;
+        int32_t afterTime = 0;
+        int32_t utcOffsetSeconds = (int32_t)lroundf(appConfig.timezone * 3600.0f);
+        E_RC clockRc = smaInverter.syncPlantTime(utcOffsetSeconds, &beforeTime, &afterTime);
+        if (clockRc == E_OK) {
+          clockSyncStatus = "Verified: " + formatLocalEpoch(beforeTime) + " -> " + formatLocalEpoch(afterTime);
+        } else {
+          clockSyncStatus = "Clock sync failed with code " + String((int)clockRc) + "; no automatic retry";
+          logW("Clock sync failed (%d)", clockRc);
+        }
+      }
+      if (rc == E_OK) {
+        InverterData previousInvData = invData;
+        DisplayData previousDispData = dispData;
+        rc = smaInverter.ReadCurrentData();
+        if (rc == E_OK) {
+          freshData = true;
+        } else {
+          invData = previousInvData;
+          dispData = previousDispData;
+          logW("Discarding incomplete inverter read (%d)", rc);
+        }
+      } else {
+        logW("Skipping inverter read after setup/login failure (%d)", rc);
+      }
 #ifdef LOGOFF    
       //logoff before disconnecting
-      logoffSMAInverter();
+      smaInverter.logoffSMAInverter();
 #endif
       
       smaInverter.disconnect(); //moved btConnected to inverter class
-      //Send Home Assistant autodiscover
-      if(appConfig.mqttBroker.length() > 0 && appConfig.hassDisc ) { 
-        if(firstTime){
-          mqttInstanceForApp.hassAutoDiscover(1800); // Start with night time expire period
-        //mqttInstanceForApp.hassAutoDiscover(appConfig.scanRate *2);
-          mqttInstanceForApp.logViaMQTT("First boot");
-          firstTime=false;
-          dayNight = nightTime; // Set the flag to current state on boot
-        } else if( nightTime != dayNight ) {
-          if (nightTime) { // Change the expire time in home Assistant
-            mqttInstanceForApp.hassAutoDiscover(1800);
-            mqttInstanceForApp.logViaMQTT("Night Time");
-          } else {
-            mqttInstanceForApp.hassAutoDiscover(appConfig.scanRate *2);
-            mqttInstanceForApp.logViaMQTT("Day Time");
-          }
-          dayNight = nightTime;
-        }
-        delay(5000);
-      }
-
 //       mqttInstanceForApp.publishData();
       failCount=0;
     } else { 
@@ -174,18 +201,53 @@ void ESP32_SMA_Inverter_App::appLoop() {
         }
       }
     } 
-    mqttInstanceForApp.publishData();
   }
   
   if (invData.Serial != 0 && appConfig.thisSerial != invData.Serial) {
     appConfig.thisSerial = invData.Serial;
     ESP32_SMA_Inverter_App::getInstance().saveConfiguration();
   }
+  // Discovery carries the sensor expiry. Update it when the polling mode changes,
+  // even if the inverter has gone to sleep and no new reading can be published.
+  const uint32_t currentSerial = invData.Serial != 0 ? invData.Serial : appConfig.thisSerial;
+  if (appConfig.hassDisc && appConfig.mqttBroker.length() > 0 &&
+      currentSerial != 0 &&
+      (firstTime || nightTime != dayNight || currentSerial != discoveredSerial) &&
+      (int32_t)(millis() - nextDiscoveryAttempt) >= 0) {
+    const int expiry = nightTime
+        ? max(2700, (NIGHTSCANRATE / 1000) * 3)
+        : max(300, constrain(appConfig.scanRate, 10, 3600) * 3 + 60);
+    nextDiscoveryAttempt = millis() + 60000UL;
+    if (mqttInstanceForApp.hassAutoDiscover(expiry)) {
+      if (firstTime) mqttInstanceForApp.logViaMQTT("First boot");
+      else mqttInstanceForApp.logViaMQTT(nightTime ? "Night Time" : "Day Time");
+      firstTime = false;
+      dayNight = nightTime;
+      discoveredSerial = currentSerial;
+    }
+  }
+  // Publish the fresh, non-retained reading after Home Assistant has its discovery config.
+  if (freshData) {
+    mqttInstanceForApp.publishData();
+  }
   // DEBUG1_PRINT(".");
   mqttInstanceForApp.wifiLoop();
 
     
   delay(100);
+}
+
+void ESP32_SMA_Inverter_App::requestClockSync() {
+  time_t now = time(nullptr);
+  if (now < 1700000000) {
+    clockSyncRequested = false;
+    clockSyncStatus = "Rejected: ESP NTP time is not valid";
+    return;
+  }
+  clockSyncRequested = true;
+  clockSyncRequestDeadline = millis() + 5UL * 60UL * 1000UL;
+  nextTime = millis();
+  clockSyncStatus = "Queued for the next inverter connection; expires in five minutes";
 }
 
 
@@ -208,8 +270,7 @@ void ESP32_SMA_Inverter_App::loadConfiguration() {
   std::vector<std::string> keyNames = {"mqttBroker", "mqttPort", "mqttUser","mqttPasswd", "mqttTopic","smaInvPass", "smaBTAddress", "scanRate", "hassDisc","thisserial"};
   for (uint i=0;i<keyNames.size();i++) {
     std::string k = keyNames[i];
-    std::string v = doc[k];
-    log_w("load key: %s , value: %s", k.c_str(), v.c_str());
+    log_w("loaded key: %s", k.c_str());
   }
 
   #ifdef SMA_WIFI_CONFIG_VALUES_H
@@ -236,8 +297,8 @@ void ESP32_SMA_Inverter_App::loadConfiguration() {
     appConfig.scanRate = doc["scanRate"] | 60 ;
     appConfig.hassDisc = doc["hassDisc"] | true ;
     appConfig.timezone = doc["timezone"] | 1;
-    appConfig.ntpHostname = doc["ntphostname"] | "";
-    ppConfig.thisSerial = doc["thisserial"] | THISSERIAL;
+    appConfig.ntphostname = doc["ntphostname"] | "pool.ntp.org";
+    appConfig.thisSerial = doc["thisserial"] | 0;
   #endif
 
   
@@ -250,16 +311,10 @@ void ESP32_SMA_Inverter_App::loadConfiguration() {
 
 // Saves the configuration to a file
 void ESP32_SMA_Inverter_App::saveConfiguration() {
-  // Delete existing file, otherwise the configuration is appended to the file
-  if (LittleFS.remove("/config.txt")) {
-    log_w("removed file %s", "/config.txt");
-  } else {
-    log_e("failed to removed file %s", "/config.txt");
-  }
-
-  // Open file for writing
-  log_i("creating file %s mode w", "/config.txt");
-  File file = LittleFS.open("/config.txt", "w");
+  const char *tempConfig = "/config.tmp";
+  LittleFS.remove(tempConfig);
+  log_i("creating temporary configuration file");
+  File file = LittleFS.open(tempConfig, "w");
   if (!file) {
     log_e("Failed to create file");
     return;
@@ -272,7 +327,6 @@ void ESP32_SMA_Inverter_App::saveConfiguration() {
 
   // Set the values in the document
   doc["mqttBroker"] = appConfig.mqttBroker;
-  doc["mqttPort"] = appConfig.mqttPort;
   doc["mqttPort"] = appConfig.mqttPort;
   doc["mqttUser"] = appConfig.mqttUser;
   doc["mqttPasswd"] = appConfig.mqttPasswd;
@@ -288,8 +342,7 @@ void ESP32_SMA_Inverter_App::saveConfiguration() {
   std::vector<std::string> keyNames = {"mqttBroker", "mqttPort", "mqttUser","mqttPasswd", "mqttTopic","smaInvPass", "smaBTAddress", "scanRate", "hassDisc", "timezone", "ntphostname","thisserial"};
   for (uint i=0;i<keyNames.size();i++) {
     std::string k = keyNames[i];
-    std::string v = doc[k];
-    log_w("save key: %s , value: %s", k.c_str(), v.c_str());
+    log_w("saving key: %s", k.c_str());
   }
  
   // Serialize JSON to file
@@ -301,6 +354,20 @@ void ESP32_SMA_Inverter_App::saveConfiguration() {
 
   // Close the file
   file.close();
+  const char *backupConfig = "/config.bak";
+  LittleFS.remove(backupConfig);
+  bool hadConfig = LittleFS.exists("/config.txt");
+  if (hadConfig && !LittleFS.rename("/config.txt", backupConfig)) {
+    log_e("Failed to preserve existing configuration");
+    LittleFS.remove(tempConfig);
+    return;
+  }
+  if (!LittleFS.rename(tempConfig, "/config.txt")) {
+    log_e("Failed to install configuration file");
+    if (hadConfig) LittleFS.rename(backupConfig, "/config.txt");
+    return;
+  }
+  LittleFS.remove(backupConfig);
   log_d("close file");
 }
 
@@ -313,11 +380,7 @@ void ESP32_SMA_Inverter_App::printFile() {
     return;
   }
 
-  // Extract each characters by one by one
-  while (file.available()) {
-    Serial.print((char)file.read());
-  }
-  Serial.println();
+  log_w("Configuration file present (%u bytes); secrets not printed", file.size());
 
   // Close the file
   file.close();
@@ -330,7 +393,7 @@ void ESP32_SMA_Inverter_App::configSetup() {
     if (!LittleFS.begin(true /* true: format */)) {
       Serial.println("Failed to format LittleFS");
     } else {
-      Serial.println("LittleFS formatted successfully");  return;
+      Serial.println("LittleFS formatted successfully");
     }
   } else{
     log_w("little fs mount sucess");
@@ -356,5 +419,3 @@ void ESP32_SMA_Inverter_App::rmfiles(){
     log_e("%s removal failed", "/config.txt");
   }
 }
-
-

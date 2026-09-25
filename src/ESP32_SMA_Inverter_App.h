@@ -93,12 +93,16 @@ class ESP32_SMA_Inverter_App : public ESP32Loggable {
      void printFile();
      void configSetup();
      void rmfiles();
+     void requestClockSync();
+     String getClockSyncStatus() const { return clockSyncStatus; }
 
     protected:
       //extern BluetoothSerial serialBT;
         bool nightTime = false;
         bool firstTime = true;
         bool dayNight = false;
+        uint32_t nextDiscoveryAttempt = 0;
+        uint32_t discoveredSerial = 0;
 
     private: 
         ESP32_SMA_Inverter_App() :  ESP32Loggable("ESP32_SMA_Inverter_App") {
@@ -113,12 +117,15 @@ class ESP32_SMA_Inverter_App : public ESP32Loggable {
 
         ~ESP32_SMA_Inverter_App() {}
 
-        char smaInvPass[12];  
+        char smaInvPass[13];  // 12 protocol characters plus C-string terminator
         uint8_t smaBTAddress[6]; // SMA bluetooth address
         //uint8_t  espBTAddress[6]; // is retrieved from BT packet
 
         uint32_t nextTime = 0;
         int failCount = 0;
+        bool clockSyncRequested = false;
+        uint32_t clockSyncRequestDeadline = 0;
+        String clockSyncStatus = "Never requested";
 
         const String confFile = "/config.txt"; //extern const char *confFile = "/config.txt";  
 

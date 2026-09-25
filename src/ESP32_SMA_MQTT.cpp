@@ -23,12 +23,37 @@ SOFTWARE.
 // Wifi Functions choose between Station or SoftAP
 
 #include "ESP32_SMA_MQTT.h"
+#include <esp_timer.h>
 
 #define FORMAT_LITTLEFS_IF_FAILED
 
 
 //ESP32_SMA_Inverter_App_Config& appConfigInstance = ESP32_SMA_Inverter_App_Config::getInstance();
 ESP32_SMA_MQTT& mqttInstance = ESP32_SMA_MQTT::getInstance();
+
+static String htmlEscape(const String& value) {
+  String escaped;
+  escaped.reserve(value.length() + 16);
+  for (size_t i = 0; i < value.length(); ++i) {
+    switch (value[i]) {
+      case '&': escaped += "&amp;"; break;
+      case '<': escaped += "&lt;"; break;
+      case '>': escaped += "&gt;"; break;
+      case '\"': escaped += "&quot;"; break;
+      case '\'': escaped += "&#39;"; break;
+      default: escaped += value[i]; break;
+    }
+  }
+  return escaped;
+}
+
+static bool requireWebAuthentication() {
+  AppConfig& config = ESP32_SMA_Inverter_App::getInstance().appConfig;
+  if (config.mqttUser.length() == 0) return true;
+  if (ESP32_SMA_Inverter_App::webServer.authenticate(config.mqttUser.c_str(), config.mqttPasswd.c_str())) return true;
+  ESP32_SMA_Inverter_App::webServer.requestAuthentication();
+  return false;
+}
 
 
 //link to singleton methods
@@ -40,8 +65,16 @@ extern void E_connectAP() {
   ESP32_SMA_MQTT::getInstance().connectAP();
 }
 
+extern void E_showSmartConfigConfirmation() {
+  ESP32_SMA_MQTT::getInstance().showSmartConfigConfirmation();
+}
+
 extern void E_handleForm() {
   ESP32_SMA_MQTT::getInstance().handleForm();
+}
+
+extern void E_handleSetClock() {
+  ESP32_SMA_MQTT::getInstance().handleSetClock();
 }
 
 void ESP32_SMA_MQTT::wifiTime() {
@@ -82,10 +115,18 @@ void ESP32_SMA_MQTT::wifiStartup(){
   char sapString[20]="";
   snprintf(sapString, 20, "SMA-%08X", ESP.getEfuseMac());
   mqttInstance.sapString = String(sapString);
-  logD(mqttInstance.sapString.c_str());
+  char token[17];
+  snprintf(token, sizeof(token), "%08lX%08lX", (unsigned long)esp_random(), (unsigned long)esp_random());
+  clockSyncToken = String(token);
+  snprintf(token, sizeof(token), "%08lX%08lX", (unsigned long)esp_random(), (unsigned long)esp_random());
+  smartConfigToken = String(token);
+  logD("%s", mqttInstance.sapString.c_str());
 
   // Attempt to connect to the AP stored on board, if not, start in SoftAP mode
   WiFi.mode(WIFI_STA);
+  ESP32_SMA_Inverter_App::client.setBufferSize(1024);
+  ESP32_SMA_Inverter_App::client.setKeepAlive(120);
+  ESP32_SMA_Inverter_App::client.setSocketTimeout(5);
   delay(2000);
 
   logD("setHostname");
@@ -95,7 +136,7 @@ void ESP32_SMA_MQTT::wifiStartup(){
   //overriding ssid and hostname
   logD("wifi begin with ssid(%s) and password (.......)", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  for  (int w=0; w<=10 || WiFi.status() != WL_CONNECTED; w++) {
+  for (int w = 0; w <= 10 && WiFi.status() != WL_CONNECTED; w++) {
     delay(500);
     logD(".wifi.");
   }
@@ -107,9 +148,19 @@ void ESP32_SMA_MQTT::wifiStartup(){
   logD("Using config");
 
   AppConfig& config = ESP32_SMA_Inverter_App::getInstance().appConfig;
-  logD("mqtt topic: %s", config.mqttTopic);
+  logD("mqtt topic: %s", config.mqttTopic.c_str());
   if (config.mqttTopic == "")
     config.mqttTopic = mqttInstance.sapString;
+
+  Preferences energyStore;
+  if (energyStore.begin("sma-mqtt", true)) {
+    uint32_t savedSerial = energyStore.getUInt("serial", 0);
+    if (savedSerial != 0 && savedSerial == config.thisSerial) {
+      lastAcceptedETotalWh = energyStore.getULong64("etotal", 0);
+      lastPersistedETotalWh = lastAcceptedETotalWh;
+    }
+    energyStore.end();
+  }
   int i = 0;
   while (WiFi.status() != WL_CONNECTED) {
     // Launch smartconfig to reconfigure wifi
@@ -131,10 +182,12 @@ void ESP32_SMA_MQTT::wifiStartup(){
   wifiTime();
 
 
-  ESP32_SMA_Inverter_App::webServer.begin();
   ESP32_SMA_Inverter_App::webServer.on("/", E_formPage);
-  ESP32_SMA_Inverter_App::webServer.on("/smartconfig", E_connectAP);
+  ESP32_SMA_Inverter_App::webServer.on("/smartconfig", HTTP_GET, E_showSmartConfigConfirmation);
+  ESP32_SMA_Inverter_App::webServer.on("/smartconfig", HTTP_POST, E_connectAP);
   ESP32_SMA_Inverter_App::webServer.on("/postform/", E_handleForm);
+  ESP32_SMA_Inverter_App::webServer.on("/setclock/", HTTP_POST, E_handleSetClock);
+  ESP32_SMA_Inverter_App::webServer.begin();
 
   logI("Web Server Running: ");
 
@@ -153,7 +206,7 @@ void ESP32_SMA_MQTT::mySmartConfig() {
 
   //Wait for SmartConfig packet from mobile
   logI("Waiting for SmartESP32_SMA_Inverter_App_Config::config");
-  // if no smartconfig received after 5 minutes, reboot and try again
+  // If no SmartConfig message arrives after about 8 minutes, reboot and try again.
   int count = 0;
   while (!WiFi.smartConfigDone()) {
     delay(2000);
@@ -178,9 +231,36 @@ void ESP32_SMA_MQTT::mySmartConfig() {
   ESP.restart();
 }
 
-// Use ESP SmartConfig to connect to wifi
+void ESP32_SMA_MQTT::showSmartConfigConfirmation() {
+  if (!requireWebAuthentication()) return;
+  String page =
+    "<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+    "<title>Change ESP32 Wi-Fi network</title></head><body>"
+    "<h1>Change ESP32 Wi-Fi network</h1>"
+    "<p>This starts ESPTouch setup so a phone can send new Wi-Fi credentials to the ESP32. "
+    "Use it only if you want to move the ESP32 to another Wi-Fi network.</p>"
+    "<p>You need the ESPTouch app on a phone connected to the new network. "
+    "Once started, inverter polling and MQTT updates pause, and this page may stop responding. "
+    "The ESP32 restarts after receiving the new settings or after about 8 minutes without them.</p>"
+    "<form method=\"post\" action=\"/smartconfig\">"
+    "<input type=\"hidden\" name=\"token\" value=\"" + smartConfigToken + "\">"
+    "<button type=\"submit\">Start Wi-Fi setup</button></form>"
+    "<p><a href=\"/\">Cancel and return to inverter page</a></p></body></html>";
+  ESP32_SMA_Inverter_App::webServer.sendHeader("Cache-Control", "no-store");
+  ESP32_SMA_Inverter_App::webServer.send(200, "text/html", page);
+}
+
+// Use ESP SmartConfig to connect to Wi-Fi only after the confirmation form is submitted.
 void ESP32_SMA_MQTT::connectAP(){
-  ESP32_SMA_Inverter_App::webServer.send(200, "text/plain", "Open ESPTouch: Smartconfig App to connect to Wifi Network");
+  if (!requireWebAuthentication()) return;
+  if (!ESP32_SMA_Inverter_App::webServer.hasArg("token") ||
+      ESP32_SMA_Inverter_App::webServer.arg("token") != smartConfigToken) {
+    ESP32_SMA_Inverter_App::webServer.send(403, "text/plain", "Invalid or expired request token");
+    return;
+  }
+  ESP32_SMA_Inverter_App::webServer.send(200, "text/plain",
+      "Wi-Fi setup started. Open the ESPTouch app on a phone connected to the new Wi-Fi network. "
+      "Inverter and MQTT updates are paused until the ESP32 restarts.");
   delay(2000);
   mySmartConfig();
 
@@ -189,11 +269,6 @@ void ESP32_SMA_MQTT::connectAP(){
 
 void ESP32_SMA_MQTT::wifiLoop(){
   // Attempt to reconnect to Wifi if disconnected
-  if ( WiFi.status() != WL_CONNECTED) {
-
-    WiFi.disconnect();
-    WiFi.reconnect();
-  }
   unsigned long currentMillis = millis();
   // if WiFi is down, try reconnecting
   if ((WiFi.status() != WL_CONNECTED) && (currentMillis - mqttInstance.previousMillis >= mqttInstance.interval)) {
@@ -201,6 +276,13 @@ void ESP32_SMA_MQTT::wifiLoop(){
     WiFi.disconnect();
     WiFi.reconnect();
     mqttInstance.previousMillis = currentMillis;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    publishEspStatus();
+    if (ESP32_SMA_Inverter_App::client.connected()) {
+      ESP32_SMA_Inverter_App::client.loop();
+    }
   }
 
   ESP32_SMA_Inverter_App::webServer.handleClient();
@@ -215,6 +297,10 @@ void ESP32_SMA_MQTT::formPage () {
   char fulltopic[100];
 
   responseHTML = (char *)malloc(sizeof(char)*10000);
+  if (responseHTML == nullptr) {
+    ESP32_SMA_Inverter_App::webServer.send(503, "text/plain", "Out of memory");
+    return;
+  }
   logW("Connect formpage\n");
   strcpy(responseHTML, "<!DOCTYPE html><html><head>\
                       <title>SMA Inverter</title></head><body>\
@@ -234,19 +320,19 @@ table, th, td {\
 
 
   strcat(responseHTML, "<TABLE><TR><TH>Configuration</TH><TH>Setting</TH></TR>\n");
-  sprintf(tempstr, "<TR><TD>Inverter Bluetooth Address (Format AA:BB:CC:DD:EE:FF) : </TD><TD> <input type=\"text\" name=\"btaddress\" value=\"%s\"></TD><TR>\n\n",config.smaBTAddress.c_str());
+  sprintf(tempstr, "<TR><TD>Inverter Bluetooth Address (Format AA:BB:CC:DD:EE:FF) : </TD><TD> <input maxlength=\"17\" type=\"text\" name=\"btaddress\" value=\"%s\"></TD><TR>\n\n",htmlEscape(config.smaBTAddress).c_str());
   strcat(responseHTML, tempstr);
-  sprintf(tempstr, "<TR><TD>MQTT Inverter Password :</TD><TD> <input type=\"text\" name=\"smapw\" value=\"%s\"></TD><TR>\n\n",config.smaInvPass.c_str());
+  sprintf(tempstr, "<TR><TD>SMA Inverter Password:</TD><TD><input maxlength=\"12\" type=\"password\" name=\"smapw\" placeholder=\"unchanged\"></TD><TR>\n\n");
   strcat(responseHTML, tempstr);
-  sprintf(tempstr, "<TR><TD>MQTT Broker Hostname or IP Address :</TD><TD> <input type=\"text\" name=\"mqttBroker\" value=\"%s\"></TD><TR>\n\n",config.mqttBroker.c_str());
+  sprintf(tempstr, "<TR><TD>MQTT Broker Hostname or IP Address :</TD><TD> <input maxlength=\"128\" type=\"text\" name=\"mqttBroker\" value=\"%s\"></TD><TR>\n\n",htmlEscape(config.mqttBroker).c_str());
   strcat(responseHTML, tempstr);
   sprintf(tempstr, "<TR><TD>MQTT Broker Port : </TD><TD><input type=\"text\" name=\"mqttPort\" value=\"%d\"></TD><TR>\n\n",config.mqttPort);
   strcat(responseHTML, tempstr);
-  sprintf(tempstr, "<TR><TD>MQTT Broker User :</TD><TD> <input type=\"text\" name=\"mqttUser\" value=\"%s\"></TD><TR>\n\n",config.mqttUser.c_str());
+  sprintf(tempstr, "<TR><TD>MQTT Broker User :</TD><TD> <input maxlength=\"128\" type=\"text\" name=\"mqttUser\" value=\"%s\"></TD><TR>\n\n",htmlEscape(config.mqttUser).c_str());
   strcat(responseHTML, tempstr);
-  sprintf(tempstr, "<TR><TD>MQTT Broker Password :</TD><TD> <input type=\"text\" name=\"mqttPasswd\" value=\"%s\"></TD><TR>\n\n",config.mqttPasswd.c_str());
+  sprintf(tempstr, "<TR><TD>MQTT Broker Password :</TD><TD> <input maxlength=\"128\" type=\"password\" name=\"mqttPasswd\" placeholder=\"unchanged\"></TD><TR>\n\n");
   strcat(responseHTML, tempstr);
-  sprintf(tempstr, "<TR><TD>MQTT Topic Preamble:</TD><TD> <input type=\"text\" name=\"mqttTopic\" value=\"%s\"></TD><TR>\n\n",config.mqttTopic.c_str());
+  sprintf(tempstr, "<TR><TD>MQTT Topic Preamble:</TD><TD> <input maxlength=\"32\" type=\"text\" name=\"mqttTopic\" value=\"%s\"></TD><TR>\n\n",htmlEscape(config.mqttTopic).c_str());
   strcat(responseHTML, tempstr);
   sprintf(tempstr, "<TR><TD>Inverter scan rate:</TD><TD> <input type=\"text\" name=\"scanRate\" value=\"%d\"></TD><TR>\n\n",config.scanRate);
   strcat(responseHTML, tempstr);
@@ -257,13 +343,24 @@ table, th, td {\
 
   if (config.hassDisc) {
     strcat(responseHTML, "<TR><TD>Home Assistant Auto Discovery:</TD><TD> <input type=\"checkbox\" name=\"hassDisc\" checked ></TD><TR>\n");
-    snprintf(fulltopic,sizeof(fulltopic),"homeassistant/sensor/%s/%d/state",config.mqttTopic.c_str(),invData.Serial);
+    snprintf(fulltopic,sizeof(fulltopic),"sma/solar/%s-%lu/state",config.mqttTopic.c_str(),(unsigned long)config.thisSerial);
   } else {
     strcat(responseHTML, "<TR><TD>Home Assistant Auto Discovery:</TD><TD> <input type=\"checkbox\" name=\"hassDisc\"></TD><TR>\n");
-    snprintf(fulltopic,sizeof(fulltopic),"%s/%d/state",config.mqttTopic.c_str(),invData.Serial);
+    snprintf(fulltopic,sizeof(fulltopic),"%s-%lu/state",config.mqttTopic.c_str(),(unsigned long)config.thisSerial);
   }
   strcat(responseHTML, "</TABLE>");
-  strcat(responseHTML, "<input type=\"submit\" value=\"Submit\"></form><BR> <A href=\"/smartconfig\">Enable ESP Touch App smart config</A><BR>");
+  strcat(responseHTML, "<input type=\"submit\" value=\"Submit\"></form><BR> <A href=\"/smartconfig\">Change ESP32 Wi-Fi network (review before starting)</A><BR>");
+
+  String clockStatus = htmlEscape(ESP32_SMA_Inverter_App::getInstance().getClockSyncStatus());
+  String espTime = htmlEscape(getTime());
+  snprintf(tempstr, sizeof(tempstr),
+    "<H2>Inverter clock</H2><P>ESP time: %s (configured UTC offset: %.2f hours)</P>"
+    "<P>Last clock action: %s</P>"
+    "<form method=\"post\" action=\"/setclock/\" onsubmit=\"return confirm('Set the inverter clock from the displayed ESP time now?');\">"
+    "<input type=\"hidden\" name=\"token\" value=\"%s\">"
+    "<input type=\"submit\" value=\"Set inverter clock from NTP\"></form><BR>",
+    espTime.c_str(), config.timezone, clockStatus.c_str(), clockSyncToken.c_str());
+  strcat(responseHTML, tempstr);
 
 
   strcat(responseHTML, "<TABLE><TR><TH>Last Scan</TH><TH>Data</TH>\n");
@@ -271,7 +368,7 @@ table, th, td {\
 
   snprintf(tempstr, sizeof(tempstr),
 "<tr><td>MQTT Topic</td><td>%s</td></tr>\n\
- <tr><td>BT Signal Strength</td><td>%4.1f %</td></tr>\n\
+ <tr><td>BT Signal Strength</td><td>%4.1f %%</td></tr>\n\
   <tr><td>Uac</td><td>A: %15.1f ,B: %15.1f ,C: %15.1f V</td></tr>\n\
  <tr><td>Iac</td><td>A: %15.1f ,B: %15.1f ,C: %15.1f A</td></tr>\n\
  <tr><td>Pac</td><td>%15.0f W</td></tr>\n\
@@ -305,8 +402,23 @@ table, th, td {\
   free(responseHTML);
 }
 
+void ESP32_SMA_MQTT::handleSetClock() {
+  if (!requireWebAuthentication()) return;
+  if (!ESP32_SMA_Inverter_App::webServer.hasArg("token") ||
+      ESP32_SMA_Inverter_App::webServer.arg("token") != clockSyncToken) {
+    ESP32_SMA_Inverter_App::webServer.send(403, "text/plain", "Invalid or expired request token");
+    return;
+  }
+
+  ESP32_SMA_Inverter_App::getInstance().requestClockSync();
+  String response = ESP32_SMA_Inverter_App::getInstance().getClockSyncStatus();
+  response += "\n\nReturn to the main page to check the verified result.";
+  ESP32_SMA_Inverter_App::webServer.send(202, "text/plain", response);
+}
+
 // Function to extract the configuration
 void ESP32_SMA_MQTT::handleForm() {
+  if (!requireWebAuthentication()) return;
   AppConfig& config = ESP32_SMA_Inverter_App::getInstance().appConfig;
 
   logW("Connect handleForm\n");
@@ -319,105 +431,215 @@ void ESP32_SMA_MQTT::handleForm() {
       String name = ESP32_SMA_Inverter_App::webServer.argName(i);
       String v = ESP32_SMA_Inverter_App::webServer.arg(i);
       v.trim();
-      logW("%s: %s ",name.c_str(), v.c_str());
+      logW("Received setting: %s", name.c_str());
       if (name == "mqttBroker") {
-        config.mqttBroker = v.c_str();
+        config.mqttBroker = v.substring(0, 128);
       } else if (name == "mqttPort") {
         String val = v.c_str();
-        config.mqttPort = val.toInt();
+        long port = val.toInt();
+        if (port > 0 && port <= 65535) config.mqttPort = port;
       } else if (name == "mqttUser") {
-        config.mqttUser = v.c_str();
+        config.mqttUser = v.substring(0, 128);
       } else if (name == "mqttPasswd") {
-        config.mqttPasswd = v.c_str();
+        if (v.length() > 0) config.mqttPasswd = v.substring(0, 128);
       } else if (name == "mqttTopic") {
-        config.mqttTopic = v.c_str();
+        if (v.length() > 0) config.mqttTopic = v.substring(0, 32);
       } else if (name == "btaddress") {
-        config.smaBTAddress = v.c_str();
+        unsigned int octet[6];
+        if (v.length() == 17 && sscanf(v.c_str(), "%2x:%2x:%2x:%2x:%2x:%2x",
+            &octet[0], &octet[1], &octet[2], &octet[3], &octet[4], &octet[5]) == 6) {
+          config.smaBTAddress = v;
+        } else {
+          logW("Rejected invalid Bluetooth address");
+        }
       } else if (name == "smapw") {
-        config.smaInvPass = v.c_str();
+        if (v.length() > 0 && v.length() <= 12) config.smaInvPass = v;
       } else if (name == "scanRate") {
-        config.scanRate = atoi(v.c_str());
+        config.scanRate = constrain(atoi(v.c_str()), 10, 3600);
       } else if (name == "hassDisc") {
         logW("%s\n",v.c_str());
         config.hassDisc = true;
       } else if (name == "timezone") {
-        config.timezone = atof(v.c_str());
+        config.timezone = constrain(atof(v.c_str()), -12.0, 14.0);
       } else if (name == "ntphostname") {
-        config.ntphostname = v.c_str();
+        config.ntphostname = v.substring(0, 128);
       }
 
     }
     ESP32_SMA_Inverter_App::getInstance().saveConfiguration();
-    ESP32_SMA_Inverter_App::getInstance().printFile();
     delay(3000);
     ESP.restart();
   }
 }
 
-void ESP32_SMA_MQTT::brokerConnect() {
+bool ESP32_SMA_MQTT::brokerConnect() {
   AppConfig& config = ESP32_SMA_Inverter_App::getInstance().appConfig;
   if(config.mqttBroker.length() < 1 ){
-    return;
+    return false;
   }
   logW("Connecting to MQTT Broker");
 
   ESP32_SMA_Inverter_App::client.setServer(config.mqttBroker.c_str(), config.mqttPort);
 
   // client.setCallback(callback);
-  for(int i =0; i < 3;i++) {
-    if ( !ESP32_SMA_Inverter_App::client.connected()){
+  if (!ESP32_SMA_Inverter_App::client.connected()) {
+      espDiscoveryPublished = false;
       logW("The client %s connects to the mqtt broker %s ", mqttInstance.sapString.c_str(), config.mqttBroker.c_str());
       // If there is a user account
-      if(config.mqttUser.length() > 1){
+      if(config.mqttUser.length() > 0){
         logW(" with user/password\n");
-        if (ESP32_SMA_Inverter_App::client.connect(mqttInstance.sapString.c_str(),config.mqttUser.c_str(),config.mqttPasswd.c_str())) {
-        } else {
+        if (!ESP32_SMA_Inverter_App::client.connect(mqttInstance.sapString.c_str(),config.mqttUser.c_str(),config.mqttPasswd.c_str())) {
           log_e("mqtt connect failed with state %i",ESP32_SMA_Inverter_App::client.state());
-          delay(2000);
         }
       } else {
         logW(" without user/password ");
-        if (ESP32_SMA_Inverter_App::client.connect(mqttInstance.sapString.c_str())) {
-        } else {
+        if (!ESP32_SMA_Inverter_App::client.connect(mqttInstance.sapString.c_str())) {
           log_e("mqtt connect failed with state %i", ESP32_SMA_Inverter_App::client.state());
-          delay(2000);
         }
       }
     }
+  return ESP32_SMA_Inverter_App::client.connected();
+}
+
+// ESP status is published independently of inverter polling, including at night.
+bool ESP32_SMA_MQTT::publishEspDiscovery(const char *stateTopic) {
+  struct Sensor {
+    const char *id;
+    const char *name;
+    const char *field;
+    const char *deviceClass;
+    const char *unit;
+  };
+  const Sensor sensors[] = {
+    {"ip", "IP address", "IP", nullptr, nullptr},
+    {"wifi_rssi", "Wi-Fi signal", "WiFiRSSI", "signal_strength", "dBm"},
+    {"uptime", "Uptime", "Uptime", "duration", "s"},
+    {"free_heap", "Free heap", "FreeHeap", "data_size", "B"},
+  };
+  AppConfig& config = ESP32_SMA_Inverter_App::getInstance().appConfig;
+  InverterData& invData = ESP32_SMA_Inverter::getInstance().invData;
+  const uint32_t serial = invData.Serial != 0 ? invData.Serial : config.thisSerial;
+  if (serial == 0) return false;
+  const String inverterId = config.mqttTopic + "-" + String(serial);
+  // Clear the retired clock sensor from both discovery layouts.
+  char oldTimeTopic[128];
+  char inverterTimeTopic[128];
+  snprintf(oldTimeTopic, sizeof(oldTimeTopic),
+           "homeassistant/sensor/%s/esp_time/config", sapString.c_str());
+  snprintf(inverterTimeTopic, sizeof(inverterTimeTopic),
+           "homeassistant/sensor/%s/esp_time/config", inverterId.c_str());
+  if (!ESP32_SMA_Inverter_App::client.publish(oldTimeTopic, "", true) ||
+      !ESP32_SMA_Inverter_App::client.publish(inverterTimeTopic, "", true)) return false;
+  // Retained configs from older firmware keep the separate ESP32 device alive.
+  // Remove them before publishing the same entities under the inverter device.
+  for (const Sensor& sensor : sensors) {
+    char oldTopic[128];
+    snprintf(oldTopic, sizeof(oldTopic),
+             "homeassistant/sensor/%s/esp_%s/config", sapString.c_str(), sensor.id);
+    if (!ESP32_SMA_Inverter_App::client.publish(oldTopic, "", true)) return false;
   }
+  bool success = true;
+  for (const Sensor& sensor : sensors) {
+    char discoveryTopic[128];
+    snprintf(discoveryTopic, sizeof(discoveryTopic),
+             "homeassistant/sensor/%s/esp_%s/config", inverterId.c_str(), sensor.id);
+    StaticJsonDocument<512> discovery;
+    discovery["name"] = sensor.name;
+    discovery["state_topic"] = stateTopic;
+    discovery["value_template"] = String("{{ value_json.") + sensor.field + " }}";
+    discovery["unique_id"] = sapString + "-esp-" + sensor.id;
+    discovery["entity_category"] = "diagnostic";
+    discovery["expire_after"] = 180;
+    if (sensor.deviceClass) discovery["device_class"] = sensor.deviceClass;
+    if (sensor.unit) discovery["unit_of_measurement"] = sensor.unit;
+    JsonObject device = discovery.createNestedObject("device");
+    device.createNestedArray("identifiers").add(inverterId);
+    device["name"] = inverterId;
+    device["manufacturer"] = "SMA";
+    device["configuration_url"] = String("http://") + WiFi.localIP().toString() + "/";
+    char payload[512];
+    size_t length = measureJson(discovery);
+    if (discovery.overflowed() || length >= sizeof(payload)) {
+      success = false;
+      continue;
+    }
+    serializeJson(discovery, payload, sizeof(payload));
+    if (!ESP32_SMA_Inverter_App::client.publish(discoveryTopic, payload, true)) {
+      success = false;
+    }
+  }
+  return success;
+}
+
+bool ESP32_SMA_MQTT::publishEspStatus() {
+  AppConfig& config = ESP32_SMA_Inverter_App::getInstance().appConfig;
+  if (config.mqttBroker.isEmpty() || WiFi.status() != WL_CONNECTED) return false;
+
+  const unsigned long nowMillis = millis();
+  if (lastEspStatusMillis != 0 && nowMillis - lastEspStatusMillis < 60000UL) return true;
+  lastEspStatusMillis = nowMillis;
+  if (!brokerConnect()) return false;
+
+  char stateTopic[96];
+  snprintf(stateTopic, sizeof(stateTopic), "sma/solar/%s/esp/state", sapString.c_str());
+  InverterData& invData = ESP32_SMA_Inverter::getInstance().invData;
+  const uint32_t serial = invData.Serial != 0 ? invData.Serial : config.thisSerial;
+  if (config.hassDisc && serial != 0 &&
+      (!espDiscoveryPublished || espDiscoveredSerial != serial)) {
+    espDiscoveryPublished = publishEspDiscovery(stateTopic);
+    if (espDiscoveryPublished) espDiscoveredSerial = serial;
+  }
+
+  StaticJsonDocument<256> status;
+  status["IP"] = WiFi.localIP().toString();
+  status["WiFiRSSI"] = WiFi.RSSI();
+  status["Uptime"] = (uint64_t)(esp_timer_get_time() / 1000000LL);
+  status["FreeHeap"] = ESP.getFreeHeap();
+  char payload[256];
+  size_t length = serializeJson(status, payload, sizeof(payload));
+  return length > 0 && ESP32_SMA_Inverter_App::client.publish(
+      stateTopic, reinterpret_cast<const uint8_t*>(payload), length, false);
 }
 
 // Returns true if nighttime
-void ESP32_SMA_MQTT::publishData(){
+bool ESP32_SMA_MQTT::publishData(){
   InverterData& invData = ESP32_SMA_Inverter::getInstance().invData;
   DisplayData& dispData = ESP32_SMA_Inverter::getInstance().dispData;
   AppConfig& config = ESP32_SMA_Inverter_App::getInstance().appConfig;
 
   if(config.mqttBroker.length() < 1 ){
-    return;
+    return false;
   }
 
-  brokerConnect();
-  if (ESP32_SMA_Inverter_App::client.connected()){
+  if (invData.ETotal < 10000) {
+    logW("Rejecting invalid lifetime energy counter");
+    return false;
+  }
+  if (lastAcceptedETotalWh != 0 && invData.ETotal < lastAcceptedETotalWh) {
+    logW("Rejecting decreased lifetime energy counter");
+    return false;
+  }
+
+  if (brokerConnect()){
     char theData[2000];
     // char tmpstr[100];
 
     // Etotal should never read less that the last good value, sometimes the value is set to 0 which causes havoc in the Home Assistant Energy display
     // Send "unavailable" instead
-    if (dispData.ETotal > 10) {
+    if (invData.ETotal >= 10000) {
       snprintf(theData,sizeof(theData)-1,
     "{ \"Serial\": %d, \"BTStrength\": %6.2f, \"Uac\": [ %6.2f, %6.2f, %6.2f ], \"Iac\": [ %6.2f, %6.2f, %6.2f ], \"Pac\": %6.0f, \"Udc\": [ %6.2f , %6.2f ], \"Idc\": [ %6.2f , %6.2f ], \"Wdc\": [%6.0f , %6.0f ], \"Freq\": %5.2f, \"EToday\": %6.2f, \"ETotal\": %15.2f, \"InvTemp\": %4.2f, \"DevStatus\": \"%s\", \"GridRelay\": \"%s\" }"
     , invData.Serial
     , dispData.BTSigStrength
     , dispData.Uac[0],dispData.Uac[1],dispData.Uac[2]
-    , dispData.Iac[0],dispData.Iac[1],dispData.Iac[1]
+    , dispData.Iac[0],dispData.Iac[1],dispData.Iac[2]
     , dispData.Pac
     , dispData.Udc[0], dispData.Udc[1]
     , dispData.Idc[0], dispData.Idc[1]
     , dispData.Udc[0] * dispData.Idc[0] , dispData.Udc[1] * dispData.Idc[1]
     , dispData.Freq
-    , dispData.EToday
-    , dispData.ETotal
+    , (double)invData.EToday / 1000.0
+    , (double)invData.ETotal / 1000.0
     , dispData.InvTemp
     , getInverterCode(invData.DevStatus).c_str()
     , getInverterCode(invData.GridRelay).c_str()
@@ -429,7 +651,7 @@ void ESP32_SMA_MQTT::publishData(){
     , invData.Serial
     , dispData.BTSigStrength
     , dispData.Uac[0],dispData.Uac[1],dispData.Uac[2]
-    , dispData.Iac[0],dispData.Iac[1],dispData.Iac[1]
+    , dispData.Iac[0],dispData.Iac[1],dispData.Iac[2]
     , dispData.Pac
     , dispData.Udc[0], dispData.Udc[1]
     , dispData.Idc[0], dispData.Idc[1]
@@ -447,23 +669,32 @@ void ESP32_SMA_MQTT::publishData(){
     // strcat(theData,"}");
     char topic[100];
     if (config.hassDisc)
-      snprintf(topic,sizeof(topic), "sma/solar/%s-%d/state",config.mqttTopic.c_str(), config.thisSerial);
+      snprintf(topic,sizeof(topic), "sma/solar/%s-%lu/state",config.mqttTopic.c_str(), (unsigned long)config.thisSerial);
     else
-      snprintf(topic,sizeof(topic), "%s-%d/state",config.mqttTopic.c_str(), config.thisSerial);
+      snprintf(topic,sizeof(topic), "%s-%lu/state",config.mqttTopic.c_str(), (unsigned long)config.thisSerial);
     logI("%s = %s",topic, theData);
     int len = strlen(theData);
-    ESP32_SMA_Inverter_App::client.beginPublish(topic,len,false);
-    if (ESP32_SMA_Inverter_App::client.print(theData))
+    if (ESP32_SMA_Inverter_App::client.publish(topic, reinterpret_cast<const uint8_t*>(theData), len, false)) {
       logI("Published\n");
-    else
+      lastAcceptedETotalWh = invData.ETotal;
+      if (lastPersistedETotalWh == 0 || invData.ETotal - lastPersistedETotalWh >= 1000) {
+        Preferences energyStore;
+        if (energyStore.begin("sma-mqtt", false)) {
+          energyStore.putUInt("serial", invData.Serial);
+          energyStore.putULong64("etotal", invData.ETotal);
+          energyStore.end();
+          lastPersistedETotalWh = invData.ETotal;
+        }
+      }
+      return true;
+    } else {
       logW("Failed Publish\n");
-    ESP32_SMA_Inverter_App::client.endPublish();
+    }
   }
+  return false;
 }
 
 void ESP32_SMA_MQTT::logViaMQTT(const char *logStr){
-  InverterData& invData = ESP32_SMA_Inverter::getInstance().invData;
-  DisplayData& dispData = ESP32_SMA_Inverter::getInstance().dispData;
   AppConfig& config = ESP32_SMA_Inverter_App::getInstance().appConfig;
 
   char tmp[1000];
@@ -477,24 +708,21 @@ void ESP32_SMA_MQTT::logViaMQTT(const char *logStr){
 
     // strcat(theData,"}");
     char topic[100];
-    snprintf(topic,sizeof(topic), "sma/solar/%s-%d/state",config.mqttTopic.c_str(), invData.Serial);
-    logI(topic);
-    logI(" = ");
+    snprintf(topic,sizeof(topic), "sma/solar/%s-%lu/log",config.mqttTopic.c_str(), (unsigned long)config.thisSerial);
+    logI("%s = ", topic);
     logI(" %s\n",tmp);
     int len = strlen(tmp);
-    ESP32_SMA_Inverter_App::client.beginPublish(topic,len,false);
-    if (ESP32_SMA_Inverter_App::client.print(tmp))
+    if (ESP32_SMA_Inverter_App::client.publish(topic, reinterpret_cast<const uint8_t*>(tmp), len, false))
       logI("Published\n");
     else
       logW("Failed Publish\n");
-    ESP32_SMA_Inverter_App::client.endPublish();
   }
 
 }
 
 
 // Set up the topics in home assistant
-void ESP32_SMA_MQTT::hassAutoDiscover(int timeout){
+bool ESP32_SMA_MQTT::hassAutoDiscover(int timeout){
 
   InverterData& invData = ESP32_SMA_Inverter::getInstance().invData;
   DisplayData& dispData = ESP32_SMA_Inverter::getInstance().dispData;
@@ -502,9 +730,12 @@ void ESP32_SMA_MQTT::hassAutoDiscover(int timeout){
 
   char msg[500];
   char topic[50];
-  brokerConnect();
+  if (!brokerConnect()) return false;
+  discoveryPublishOK = true;
 
-  snprintf(topic,sizeof(topic)-1, "%s-%d",config.mqttTopic.c_str(), invData.Serial);
+  const uint32_t serial = invData.Serial != 0 ? invData.Serial : config.thisSerial;
+  if (serial == 0) return false;
+  snprintf(topic,sizeof(topic), "%s-%lu", config.mqttTopic.c_str(), (unsigned long)serial);
   const size_t msg_size = sizeof(msg);
 
     sendHassAuto(msg, msg_size, timeout, topic, "power", "measurement", "true", "AC Power", "W", "Pac", "Pac");
@@ -529,42 +760,43 @@ void ESP32_SMA_MQTT::hassAutoDiscover(int timeout){
     sendHassAutoNoClassNoUnit(msg, msg_size, timeout, topic, "Device Status", "DevStatus", "DevStatus");
     sendHassAutoNoClassNoUnit(msg, msg_size, timeout, topic, "Grid Relay Status", "GridRelay", "GridRelay");
     sendHassAutoNoClass(msg, msg_size, timeout, topic, "Bluetooth", "%", "BTStrength", "BTStrength");
-    sendHassAutoNoClassNoUnit(msg, msg_size, timeout, topic, "Log", "Log", "Log");
 
+    return discoveryPublishOK && ESP32_SMA_Inverter_App::client.connected();
 }
 
 void ESP32_SMA_MQTT::sendHassAutoNoClassNoUnit(char *msg, size_t msg_size, int timeout, const char *topic, const char *devname, const char *sensortype, const char *sensortypeid) {
     snprintf(msg, msg_size, "{\"name\": \"%s\" , \"state_topic\": \"sma/solar/%s/state\", \"expire_after\": %d, \"value_template\": \"{{ value_json.%s }}\", \"unique_id\": \"%s-%s\" , \"device\": { \"identifiers\": [\"%s\"], \"name\": \"%s\", \"manufacturer\": \"SMA\"  } }", devname, topic, timeout, sensortype, topic, sensortypeid, topic, topic);
-    logD(msg);
-    sendLongMQTT(topic, sensortypeid, msg);
+    logD("%s", msg);
+    discoveryPublishOK &= sendLongMQTT(topic, sensortypeid, msg);
 }
 
 void
 ESP32_SMA_MQTT::sendHassAutoNoClass(char *msg, size_t msg_size, int timeout, const char *topic, const char *devname, const char *unitOf, const char *sensortype, const char *sensortypeid) {
     snprintf(msg, msg_size, "{\"name\": \"%s\" , \"state_topic\": \"sma/solar/%s/state\", \"unit_of_measurement\": \"%s\", \"expire_after\": %d, \"value_template\": \"{{ value_json.%s }}\", \"unique_id\": \"%s-%s\" , \"device\": { \"identifiers\": [\"%s\"], \"name\": \"%s\", \"manufacturer\": \"SMA\"  } }", devname, topic, unitOf, timeout, sensortype, topic, sensortypeid, topic, topic);
-    logD(msg);
-    sendLongMQTT(topic, sensortypeid, msg);
+    logD("%s", msg);
+    discoveryPublishOK &= sendLongMQTT(topic, sensortypeid, msg);
 }
 
 void ESP32_SMA_MQTT::sendHassAuto(char *msg, size_t msg_size, int timeout, const char *topic, const char *devclass, const char *stateclass, const char *forceupdate,
                                   const char *devname, const char *unitOf, const char *sensortype,
                                   const char *sensortypeid) {
-    snprintf(msg, msg_size, "{\"device_class\": \"%s\", \"state_class\": \"%s\", \"force_update\": \"%s\", \"name\": \"%s\" , \"state_topic\": \"sma/solar/%s/state\", \"unit_of_measurement\": \"%s\", \"expire_after\": %d, \"value_template\": \"{{ value_json.%s }}\", \"unique_id\": \"%s-%s\", \"device\": { \"identifiers\": [\"%s\"], \"name\": \"%s\", \"manufacturer\": \"SMA\"  } } ", 
+    snprintf(msg, msg_size, "{\"device_class\": \"%s\", \"state_class\": \"%s\", \"force_update\": %s, \"name\": \"%s\" , \"state_topic\": \"sma/solar/%s/state\", \"unit_of_measurement\": \"%s\", \"expire_after\": %d, \"value_template\": \"{{ value_json.%s }}\", \"unique_id\": \"%s-%s\", \"device\": { \"identifiers\": [\"%s\"], \"name\": \"%s\", \"manufacturer\": \"SMA\"  } } ",
       devclass, stateclass, forceupdate, devname, topic, unitOf, timeout, sensortype, topic, sensortypeid, topic, topic);
-    logD(msg);
-    sendLongMQTT(topic, sensortypeid, msg);
+    logD("%s", msg);
+    discoveryPublishOK &= sendLongMQTT(topic, sensortypeid, msg);
 }
 
-void ESP32_SMA_MQTT::sendLongMQTT(const char *topic, const char *postscript, const char *msg){
+bool ESP32_SMA_MQTT::sendLongMQTT(const char *topic, const char *postscript, const char *msg){
   int len = strlen(msg);
   char tmpstr[100];
   snprintf(tmpstr,sizeof(tmpstr),"homeassistant/sensor/%s/%s/config",topic,postscript);
-  ESP32_SMA_Inverter_App::client.beginPublish(tmpstr,len,true);
   logI("%s:  %s... ",tmpstr,msg);
-   if (ESP32_SMA_Inverter_App::client.print(msg))
+   if (ESP32_SMA_Inverter_App::client.publish(tmpstr, reinterpret_cast<const uint8_t*>(msg), len, true)) {
       logI("Published\n");
-    else
+      delay(50);
+      return true;
+    } else {
       logW("Failed Publish\n");
-    ESP32_SMA_Inverter_App::client.endPublish();
-    delay(200);
+    }
+    return false;
 }

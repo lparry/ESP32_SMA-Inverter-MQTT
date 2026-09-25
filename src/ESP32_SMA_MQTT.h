@@ -41,14 +41,17 @@ public:
      void wifiStartup();
      void wifiTime();
      void mySmartConfig();
+     void showSmartConfigConfirmation();
      void connectAP();
      void wifiLoop();
      void formPage ();
      void handleForm();
-     void brokerConnect();
-     void publishData();
-     void hassAutoDiscover(int timeout);
-     void sendLongMQTT(const char *topic, const char *postscript, const char *msg);
+     void handleSetClock();
+     bool brokerConnect();
+     bool publishData();
+     bool publishEspStatus();
+     bool hassAutoDiscover(int timeout);
+     bool sendLongMQTT(const char *topic, const char *postscript, const char *msg);
      void logViaMQTT(const char *logStr);
 
     String getTime();
@@ -61,6 +64,14 @@ protected:
     std::map<int, std::string> codeMap;
 
 private:
+    uint64_t lastAcceptedETotalWh = 0;
+    uint64_t lastPersistedETotalWh = 0;
+    bool discoveryPublishOK = true;
+    bool espDiscoveryPublished = false;
+    uint32_t espDiscoveredSerial = 0;
+    unsigned long lastEspStatusMillis = 0;
+    String clockSyncToken;
+    String smartConfigToken;
     // Private constructor to prevent instantiation from outside the class.
     ESP32_SMA_MQTT() : ESP32Loggable("ESP32_SMA_MQTT") {
          initMap();
@@ -107,6 +118,7 @@ private:
 
 
     void sendSensorValue(char *tmpstr, const char *topic, const int timeout);
+    bool publishEspDiscovery(const char *stateTopic);
 
     void sendHassAuto(char *msg, size_t msg_size, int timeout, const char *topic, const char *devclass, const char *stateclass, const char *forceupdate,
                                       const char *devname, const char *unitOf, const char *sensortype,
@@ -121,7 +133,9 @@ private:
 
 extern void E_formPage();
 extern void E_connectAP();
+extern void E_showSmartConfigConfirmation();
 extern void E_handleForm();
+extern void E_handleSetClock();
 
 
 #endif
