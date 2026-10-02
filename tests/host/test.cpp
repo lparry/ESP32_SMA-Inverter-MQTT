@@ -659,7 +659,23 @@ void testStatusRecordBounds(){
  assert(query(record)==E_OK);assert(ESP32_SMA_Inverter::invData.DevStatus==51);
  put(record,0,uint32_t(OperationHealth)<<8);assert(query(record)==E_INVRESP);
 }
-
+void testSignedAndUnavailableMeasurements(){
+ std::vector<uint8_t> record(40);put(record,0,(0x40U<<24)|(uint32_t(CoolsysTmpNom)<<8));
+ put(record,16,uint32_t(-1234));assert(query(record)==E_OK);
+ auto&i=ESP32_SMA_Inverter::getInstance();assert(i.invData.InvTemp==-1234);assert(std::abs(i.dispData.InvTemp+12.34f)<0.001);
+ put(record,16,uint32_t(-1));assert(query(record)==E_OK);assert(std::abs(i.dispData.InvTemp+0.01f)<0.001);
+ put(record,16,0x80000000);assert(query(record)==E_OK);assert(std::isnan(i.dispData.InvTemp));
+ put(record,0,uint32_t(CoolsysTmpNom)<<8);put(record,16,UINT32_MAX);
+ assert(query(record)==E_OK);assert(std::isnan(i.dispData.InvTemp));
+ put(record,16,0x80000000);assert(query(record)==E_OK);assert(std::isnan(i.dispData.InvTemp));
+ auto&a=ESP32_SMA_Inverter_App::getInstance();auto&m=ESP32_SMA_MQTT::getInstance();
+ a.appConfig.mqttBroker="broker";i.invData.ETotal=12345;i.invData.ETotalValid=true;m.lastAcceptedETotalWh=0;
+ i.dispData.Pac=321; a.client.messages.clear();assert(m.publishData());
+ StaticJsonDocument<2048> json;assert(!deserializeJson(json,a.client.messages.back().payload));assert(json["InvTemp"].isNull());assert(json["Pac"].as<double>()==321);
+ std::vector<uint8_t> energy(16);put(energy,0,uint32_t(MeteringTotWhOut)<<8);put(energy,8,UINT64_MAX,8);
+ assert(query(energy)==E_OK);assert(!i.invData.ETotalValid);
+ assert(m.publishData());assert(!deserializeJson(json,a.client.messages.back().payload));assert(json["ETotal"].isNull());
+}
 std::vector<uint8_t> numericRecord(uint16_t lri,uint8_t channel,int32_t value){
  std::vector<uint8_t> record(40);put(record,0,(0x40U<<24)|(uint32_t(lri)<<8)|channel);put(record,16,uint32_t(value));return record;
 }
@@ -696,12 +712,96 @@ void testUnsupportedTemperature(){
  assert(poll(false)==E_OK);assert(std::isnan(i.dispData.Uac[1]));assert(!i.invData.ETodayValid);assert(i.dispData.Pac==1234);assert(i.invData.ETotalValid);assert(std::isnan(i.dispData.InvTemp));
  assert(poll(true)==E_NODATA);i.btConnected=false;
 }
+void testEnergyFilteringDoesNotHidePower(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();
+ auto serial=i.invData.Serial;fake::nvs.clear();fake::nvsOpenFail=fake::nvsReadFail=fake::nvsFail=false;
+ a.appConfig.mqttBroker="broker";i.invData.Serial=77;i.dispData.Pac=321;i.invData.ETotalValid=true;m.loadEnergyBaseline(77);
+ StaticJsonDocument<2048> json;
+ for(uint64_t wh:{uint64_t(0),uint64_t(1234)}){
+  i.invData.ETotal=wh;assert(m.publishData());assert(!deserializeJson(json,a.client.messages.back().payload));
+  assert(!json["ETotal"].isNull());assert(std::abs(json["ETotal"].as<double>()-double(wh)/1000)<0.0001);
+ }
+ auto writes=fake::nvsWrites;i.invData.ETotal=100;assert(m.publishData());
+ assert(!deserializeJson(json,a.client.messages.back().payload));assert(json["ETotal"].isNull());assert(json["Pac"]==321);
+ assert(m.lastAcceptedETotalWh==1234);assert(fake::nvsWrites==writes);
+ i.invData.Serial=serial;m.loadEnergyBaseline(serial);fake::nvs.clear();
+}
+void testReplacingInverterResetsEnergyBaseline(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();
+ fake::nvs.clear();Preferences store;store.begin("sma-mqtt");store.putUInt("serial",123);store.putULong64("etotal",900000);
+ m.loadEnergyBaseline(123);assert(m.lastAcceptedETotalWh==900000);
+ a.appConfig.mqttBroker="broker";a.appConfig.thisSerial=123;i.invData.Serial=456;i.invData.ETotal=500;i.invData.ETotalValid=true;
+ assert(m.publishData());StaticJsonDocument<2048> json;assert(!deserializeJson(json,a.client.messages.back().payload));
+ assert(json["ETotal"].as<double>()==0.5);assert(m.energySerial==456);assert(m.lastAcceptedETotalWh==500);
+ i.invData.Serial=0;m.energySerial=0;m.lastAcceptedETotalWh=0;fake::nvs.clear();
+}
+void testEnergyPersistenceRetries(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();
+ fake::nvs.clear();fake::nvsOpenFail=fake::nvsReadFail=fake::nvsFail=false;
+ i.invData.Serial=88;i.invData.ETotal=50000;i.invData.ETotalValid=true;i.dispData.Pac=321;a.appConfig.mqttBroker="broker";
+ m.loadEnergyBaseline(88);fake::nvsFail=true;
+ assert(m.publishData());StaticJsonDocument<2048> json;assert(!deserializeJson(json,a.client.messages.back().payload));
+ assert(json["ETotal"].isNull());assert(json["Pac"]==321);assert(!m.energyBaselinePersisted);
+ assert(m.lastAcceptedETotalWh==0&&m.lastPersistedETotalWh==0);
+ fake::nvsFail=false;assert(m.publishData());assert(!deserializeJson(json,a.client.messages.back().payload));
+ assert(json["ETotal"].as<double>()==50.0);assert(m.energyBaselinePersisted);assert(m.lastPersistedETotalWh==50000);
+ auto writes=fake::nvsWrites;assert(m.publishData());assert(fake::nvsWrites==writes);
+ m.loadEnergyBaseline(88);assert(m.lastAcceptedETotalWh==50000);
+ i.invData.ETotal=50050;a.client.publishOK=false;writes=fake::nvsWrites;assert(!m.publishData());
+ assert(m.lastPersistedETotalWh==50050&&m.lastAcceptedETotalWh==50050);assert(fake::nvsWrites==writes+1);
+ auto savedFence=fake::nvs["sma-mqtt/energy-v2"];
+ a.client.publishOK=true;assert(m.publishData());assert(fake::nvs["sma-mqtt/energy-v2"]==savedFence);
+ m.loadEnergyBaseline(88);assert(m.lastAcceptedETotalWh==50050);
+ i.invData.Serial=0;m.loadEnergyBaseline(0);fake::nvs.clear();
+}
+void testEnergyFenceSurvivesReboot(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();
+ fake::nvs.clear();fake::nvsOpenFail=fake::nvsReadFail=fake::nvsFail=false;a.client.publishOK=true;
+ a.appConfig.mqttBroker="broker";a.appConfig.hassDisc=false;i.invData.Serial=77;i.invData.ETotalValid=true;i.dispData.Pac=321;
+ m.loadEnergyBaseline(77);i.invData.ETotal=100000;assert(m.publishData());
+ i.invData.ETotal=100900;assert(m.publishData());assert(m.lastPersistedETotalWh==100900);
+ m.loadEnergyBaseline(77);assert(m.lastAcceptedETotalWh==100900);
+ i.invData.ETotal=100500;assert(m.publishData());StaticJsonDocument<2048> json;
+ assert(!deserializeJson(json,a.client.messages.back().payload));assert(json["ETotal"].isNull());assert(json["Pac"]==321);
+ assert(m.lastAcceptedETotalWh==100900);
+ i.invData.Serial=0;m.loadEnergyBaseline(0);fake::nvs.clear();
+}
+void testEnergyLegacyMigration(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();
+ for(bool blobFormat:{false,true}){
+  fake::nvs.clear();fake::nvsOpenFail=fake::nvsReadFail=fake::nvsFail=false;a.client.publishOK=true;
+  Preferences old;old.begin("sma-mqtt",false);
+  if(blobFormat){uint8_t record[12];for(size_t k=0;k<4;++k)record[k]=uint32_t(88)>>(8*k);for(size_t k=0;k<8;++k)record[k+4]=uint64_t(50000)>>(8*k);old.putBytes("energy-v1",record,sizeof(record));}
+  else {old.putUInt("serial",88);old.putULong64("etotal",50000);}
+  old.end();m.loadEnergyBaseline(88);assert(m.lastAcceptedETotalWh==50000);assert(!m.energyBaselinePersisted);
+  a.appConfig.mqttBroker="broker";i.invData.Serial=88;i.invData.ETotalValid=true;i.invData.ETotal=49999;i.dispData.Pac=321;
+  assert(m.publishData());StaticJsonDocument<2048> json;assert(!deserializeJson(json,a.client.messages.back().payload));
+  assert(json["ETotal"].isNull()&&json["Pac"]==321);
+  i.invData.ETotal=50050;assert(m.publishData());assert(m.energyBaselinePersisted);
+  assert(m.lastPersistedETotalWh==50050);
+  Preferences migrated;migrated.begin("sma-mqtt",true);uint8_t record[12];
+  assert(migrated.getBytesLength("energy-v2")==sizeof(record));assert(migrated.getBytes("energy-v2",record,sizeof(record))==sizeof(record));
+  assert(get_u32(record)==88&&get_u64(record+4)==50050);migrated.end();
+ }
+ i.invData.Serial=0;m.loadEnergyBaseline(0);fake::nvs.clear();
+}
+void testEnergyStorageReadFailures(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();
+ fake::nvs.clear();fake::nvsOpenFail=fake::nvsReadFail=fake::nvsFail=false;a.client.publishOK=true;
+ a.appConfig.mqttBroker="broker";a.appConfig.hassDisc=false;i.invData.Serial=90;i.invData.ETotal=800;i.invData.ETotalValid=true;i.dispData.Pac=321;
+ fake::nvsOpenFail=true;m.loadEnergyBaseline(90);assert(!m.energyBaselineLoaded);
+ assert(m.publishData());StaticJsonDocument<2048> json;assert(!deserializeJson(json,a.client.messages.back().payload));
+ assert(json["ETotal"].isNull()&&json["Pac"]==321);assert(fake::nvs.count("sma-mqtt/energy-v2")==0);
+ fake::nvsOpenFail=false;assert(m.publishData());assert(!deserializeJson(json,a.client.messages.back().payload));
+ assert(json["ETotal"].as<double>()==0.8&&m.energyBaselinePersisted);
 
-
-
-
-
-
+ i.invData.ETotal=900;fake::nvsReadFail=true;m.loadEnergyBaseline(90);assert(!m.energyBaselineLoaded);
+ assert(m.publishData());assert(!deserializeJson(json,a.client.messages.back().payload));
+ assert(json["ETotal"].isNull()&&json["Pac"]==321);assert(m.lastAcceptedETotalWh==0);
+ fake::nvsReadFail=false;assert(m.publishData());assert(!deserializeJson(json,a.client.messages.back().payload));
+ assert(json["ETotal"].as<double>()==0.9&&m.lastAcceptedETotalWh==900);
+ i.invData.Serial=0;m.loadEnergyBaseline(0);fake::nvs.clear();
+}
 bool unsafeCrc(ESP32_SMA_Inverter&i){return !i.isCrcValid(i.pcktBuf[i.pcktBufPos-3],i.pcktBuf[i.pcktBufPos-2]);}
 void testLoginAndInitCrc(){
  auto&i=ESP32_SMA_Inverter::getInstance();auto&b=i.serialBT;uint16_t seed=0;
@@ -806,8 +906,32 @@ void testLogoffRetriesCrcCollision(){
  b.output.clear();b.writeFails=true;i.logoffSMAInverter();assert(b.output.empty());
  b.writeFails=savedWriteFails;i.pcktID=savedId;
 }
-
-
+void testDiscoveryCapacity(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();
+ a.appConfig.mqttTopic=std::string(32,'x');a.appConfig.thisSerial=UINT32_MAX;a.appConfig.mqttBroker="broker";
+ auto&i=ESP32_SMA_Inverter::getInstance();i.invData.Serial=UINT32_MAX;a.client.messages.clear();
+ assert(m.hassAutoDiscover(2700));size_t sensors=0;
+ for(auto&message:a.client.messages){if(message.payload.empty())continue;++sensors;StaticJsonDocument<2048> json;assert(!deserializeJson(json,message.payload));assert(json["device"]["name"]==std::string(32,'x')+"-4294967295");}
+ assert(sensors==20);
+ m.sapString="SMA-12345678";assert(m.publishEspDiscovery("sma/solar/SMA-12345678/esp/state"));
+ size_t diagnostics=0;for(auto&message:a.client.messages){if(message.payload.empty())continue;
+  StaticJsonDocument<2048> json;assert(!deserializeJson(json,message.payload));if(json["entity_category"]=="diagnostic")++diagnostics;
+ }
+ assert(diagnostics==4);
+ char tiny[20];m.discoveryPublishOK=true;auto count=a.client.messages.size();
+ m.sendHassAutoNoClassNoUnit(tiny,sizeof(tiny),2700,"SMA-1","Status","DevStatus","DevStatus");
+ assert(!m.discoveryPublishOK);assert(a.client.messages.size()==count);i.invData.Serial=0;
+}
+void testTopicValidationAndJsonEscaping(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();m.settingsToken="secret";a.appConfig.mqttTopic="SMA";
+ for(const char*prefix:{"bad\"topic", "bad\\topic", "bad/#", "bad+", ""}){
+  a.webServer.params={{"token","secret"},{"mqttTopic",prefix}};m.handleForm();assert(a.webServer.code==400);assert(a.appConfig.mqttTopic=="SMA");
+ }
+ char msg[768];m.discoveryPublishOK=true;
+ m.sendHassAutoNoClassNoUnit(msg,sizeof(msg),2700,"SMA-1","quoted \"name\" \\","DevStatus","DevStatus");
+ assert(m.discoveryPublishOK);StaticJsonDocument<2048> json;assert(!deserializeJson(json,msg));assert(json["name"]=="quoted \"name\" \\");
+ assert(!json["availability_template"].isNull());
+}
 void testProvisionedWifiSurvivesStartup(){
  auto&m=ESP32_SMA_MQTT::getInstance();fake::nvs.clear();WiFi.state=WL_CONNECTED;
  WiFi.compiledBegins=WiFi.storedBegins=0;m.wifiStartup();assert(WiFi.compiledBegins==1);
@@ -898,7 +1022,18 @@ void testProvisioningTimeouts(){
  }
  WiFi.done=true;WiFi.state=WL_CONNECTED;
 }
-
+void testDiscoveryAfterReconnectAndBirth(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();
+ a.appConfig.mqttBroker="broker";a.appConfig.mqttTopic="SMA";a.appConfig.hassDisc=true;a.appConfig.thisSerial=55;i.invData.Serial=55;
+ m.wifiStartup();a.firstTime=false;a.client.online=false;assert(m.brokerConnect());assert(a.firstTime);
+ a.nextTime=millis()+100000;a.client.messages.clear();a.appLoop();assert(!a.firstTime);
+ size_t configs=0;for(auto&msg:a.client.messages)if(msg.topic.find("homeassistant/sensor/SMA-55/")==0&&!msg.payload.empty()){
+  StaticJsonDocument<2048> json;assert(!deserializeJson(json,msg.payload));if(json["entity_category"].isNull())++configs;
+ }
+ assert(configs==20);
+ uint8_t online[]={'o','n','l','i','n','e'};a.client.callback(const_cast<char*>("homeassistant/status"),online,sizeof(online));assert(a.firstTime);
+ a.appLoop();assert(!a.firstTime);i.invData.Serial=0;
+}
 void testClockReplyCorrelation(){
  auto&i=ESP32_SMA_Inverter::getInstance();auto&b=i.serialBT;i.invData.SUSyID=0x1234;i.invData.Serial=55;
  i.invData.BTAddress[0]=0x20;
@@ -1040,7 +1175,13 @@ void testBluetoothWriteFailureAndSignalValidity(){
  i.dispData.BTSigStrength=70;assert(!i.getBT_SignalStrength());assert(std::isnan(i.dispData.BTSigStrength));
  b.writeFails=false;
 }
-
+void testEmptyStatusIsUnavailable(){
+ auto&i=ESP32_SMA_Inverter::getInstance();auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();
+ std::vector<uint8_t> record(40);put(record,0,(8U<<24)|(uint32_t(OperationHealth)<<8));put(record,8,0xfffffe);
+ assert(query(record)==E_OK);assert(i.invData.DevStatus==0xfffffd);i.invData.GridRelay=0xfffffd;
+ assert(m.publishData());StaticJsonDocument<2048> json;assert(!deserializeJson(json,a.client.messages.back().payload));
+ assert(json["DevStatus"].isNull());assert(json["GridRelay"].isNull());
+}
 void testInitReplyAndTrailerBounds(){
  auto&i=ESP32_SMA_Inverter::getInstance();auto&b=i.serialBT;
  for(size_t length:{size_t(61),size_t(62),size_t(63),size_t(64)}){
@@ -1221,8 +1362,132 @@ void testBluetoothAuthRecoveryMatchesTargetPeer(){
 
 
 
+void testDiscoveryIdentityCleanup(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();
+ auto config=a.appConfig;auto serial=i.invData.Serial;fake::nvs.clear();
+ fake::nvsOpenFail=fake::nvsReadFail=fake::nvsBlobDataReadFail=fake::nvsIdentityTypeMismatch=fake::nvsFail=false;
+ m.discoveryIdentityLoaded=false;m.discoveryIdentity="";m.discoveryMigrationAttempted=false;
+ a.appConfig.mqttBroker="broker";a.appConfig.mqttTopic="OLD";a.appConfig.hassDisc=true;a.appConfig.thisSerial=55;i.invData.Serial=55;
+ // An absent namespace/key is the legacy first-install case and captures the
+ // loaded identity before any later topic change can replace it.
+ assert(fake::nvs.count("sma-discovery/identity")==0);
+ assert(m.prepareDiscovery(a.appConfig));assert(m.discoveryIdentity=="OLD-55");
+ const auto savedOldIdentity=fake::nvs.at("sma-discovery/identity");
+ assert(savedOldIdentity.size()==sizeof("OLD-55"));
+ assert(std::memcmp(savedOldIdentity.data(),"OLD-55",sizeof("OLD-55"))==0);
 
+ // A topic change followed by reboot must not treat a transient NVS read
+ // failure as a missing legacy record and overwrite OLD-55 with NEW-55.
+ a.appConfig.mqttTopic="NEW";m.discoveryIdentityLoaded=false;m.discoveryIdentity="";
+ fake::nvsBlobDataReadFail=true;fake::ticks+=5001;
+ a.client.messages.clear();assert(!m.prepareDiscovery(a.appConfig));
+ assert(!m.discoveryIdentityLoaded&&m.discoveryIdentity.isEmpty());
+ assert(fake::nvs.at("sma-discovery/identity")==savedOldIdentity);
+ for(const auto&message:a.client.messages)assert(message.topic!="homeassistant/sensor/OLD-55/esp_ip/config");
 
+ // Open errors and wrong NVS types are also errors, not first-install cases.
+ fake::nvsBlobDataReadFail=false;fake::nvsOpenFail=true;
+ assert(!m.loadDiscoveryIdentity());assert(!m.discoveryIdentityLoaded);
+ assert(fake::nvs.at("sma-discovery/identity")==savedOldIdentity);
+ fake::nvsOpenFail=false;fake::nvsReadFail=true;
+ assert(!m.loadDiscoveryIdentity());assert(!m.discoveryIdentityLoaded);
+ assert(fake::nvs.at("sma-discovery/identity")==savedOldIdentity);
+ fake::nvsReadFail=false;fake::nvsIdentityTypeMismatch=true;
+ assert(!m.loadDiscoveryIdentity());assert(!m.discoveryIdentityLoaded);
+ assert(fake::nvs.at("sma-discovery/identity")==savedOldIdentity);
+ fake::nvsIdentityTypeMismatch=false;
+
+ // Once storage recovers, retry the old identity cleanup and only then save
+ // the new topic identity.
+ fake::ticks+=5001;a.client.messages.clear();
+ assert(m.prepareDiscovery(a.appConfig));
+ bool removed=false;for(auto&message:a.client.messages)if(message.topic=="homeassistant/sensor/OLD-55/esp_ip/config"){
+  assert(message.payload.empty()&&message.retained);removed=true;}
+ assert(removed);assert(m.discoveryIdentity=="NEW-55");
+ assert(std::string(reinterpret_cast<const char*>(fake::nvs.at("sma-discovery/identity").data()))=="NEW-55");
+
+ // Valid-length but malformed records are left intact for diagnosis/recovery.
+ const std::vector<uint8_t> malformed={'N','E','W','-','x',0};
+ fake::nvs["sma-discovery/identity"]=malformed;m.discoveryIdentityLoaded=false;m.discoveryIdentity="";
+ assert(!m.loadDiscoveryIdentity());assert(!m.discoveryIdentityLoaded);
+ assert(fake::nvs.at("sma-discovery/identity")==malformed);
+ const std::vector<uint8_t> oversized(45,'x');
+ fake::nvs["sma-discovery/identity"]=oversized;
+ assert(!m.loadDiscoveryIdentity());assert(!m.discoveryIdentityLoaded);
+ assert(fake::nvs.at("sma-discovery/identity")==oversized);
+ fake::nvs["sma-discovery/identity"]={};
+ assert(!m.loadDiscoveryIdentity());assert(!m.discoveryIdentityLoaded);
+ assert(fake::nvs.at("sma-discovery/identity").empty());
+
+ // Restore a valid record before exercising the ordinary serial-change path.
+ fake::nvs["sma-discovery/identity"]=savedOldIdentity;m.discoveryIdentityLoaded=false;m.discoveryIdentity="";
+ assert(m.loadDiscoveryIdentity());assert(m.discoveryIdentity=="OLD-55");
+ a.appConfig.mqttTopic="NEW";fake::ticks+=5001;
+ assert(m.prepareDiscovery(a.appConfig));assert(m.discoveryIdentity=="NEW-55");
+ i.invData.Serial=66;a.client.publishOK=false;fake::ticks+=5001;assert(!m.prepareDiscovery(a.appConfig));assert(m.discoveryIdentity=="NEW-55");
+ a.client.publishOK=true;fake::ticks+=5001;assert(m.prepareDiscovery(a.appConfig));assert(m.discoveryIdentity=="NEW-66");
+ a.appConfig.hassDisc=false;fake::nvsFail=true;fake::ticks+=5001;
+ assert(!m.prepareDiscovery(a.appConfig));assert(m.discoveryIdentity=="NEW-66");
+ fake::nvsFail=false;fake::ticks+=5001;assert(m.prepareDiscovery(a.appConfig));assert(m.discoveryIdentity.isEmpty());
+ m.discoveryIdentityLoaded=false;assert(m.loadDiscoveryIdentity());assert(m.discoveryIdentity.isEmpty());
+ fake::nvsBlobDataReadFail=fake::nvsIdentityTypeMismatch=false;
+ a.appConfig=config;i.invData.Serial=serial;
+}
+void testDiscoveryMigrationLongUptimeAndRollover(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();
+ const AppConfig savedConfig=a.appConfig;const auto savedSerial=i.invData.Serial;const auto savedTicks=fake::ticks;
+ const auto savedNvs=fake::nvs;const auto savedMessages=a.client.messages;
+ const bool savedNvsOpenFail=fake::nvsOpenFail,savedNvsReadFail=fake::nvsReadFail;
+ const bool savedNvsBlobDataReadFail=fake::nvsBlobDataReadFail,savedNvsIdentityTypeMismatch=fake::nvsIdentityTypeMismatch;
+ const bool savedNvsFail=fake::nvsFail;
+ const bool savedOnline=a.client.online,savedPublishOK=a.client.publishOK,savedConnectOK=a.client.connectOK;
+ const bool savedIdentityLoaded=m.discoveryIdentityLoaded,savedMigrationAttempted=m.discoveryMigrationAttempted;
+ const String savedIdentity=m.discoveryIdentity;const uint32_t savedLastAttempt=m.lastDiscoveryMigrationAttemptMillis;
+ fake::nvs.clear();fake::nvsOpenFail=fake::nvsReadFail=fake::nvsBlobDataReadFail=fake::nvsIdentityTypeMismatch=fake::nvsFail=false;
+ a.appConfig.mqttBroker="broker";a.appConfig.mqttTopic="FIRST";a.appConfig.hassDisc=true;a.appConfig.thisSerial=55;
+ i.invData.Serial=55;a.client.online=true;a.client.publishOK=true;a.client.connectOK=true;a.client.messages.clear();
+ m.discoveryIdentityLoaded=false;m.discoveryIdentity="";m.discoveryMigrationAttempted=false;m.lastDiscoveryMigrationAttemptMillis=0;
+
+ // A new identity can be loaded and recorded immediately even when the first
+ // discovery call happens after the signed-millis half range.
+ fake::ticks=25ULL*24*60*60*1000;
+ assert(m.prepareDiscovery(a.appConfig));assert(m.discoveryIdentity=="FIRST-55");
+
+ // A stable identity check clears any prior throttle, so a replacement after
+ // a 25-day idle period can start migration promptly.
+ fake::ticks=1000000;
+ m.discoveryMigrationAttempted=true;m.lastDiscoveryMigrationAttemptMillis=millis();
+ assert(m.prepareDiscovery(a.appConfig));assert(!m.discoveryMigrationAttempted);
+ fake::ticks+=25ULL*24*60*60*1000;
+ i.invData.Serial=56;a.client.messages.clear();
+ assert(m.prepareDiscovery(a.appConfig));assert(m.discoveryIdentity=="FIRST-56");
+ bool clearedOldIdentity=false;
+ for(const auto&message:a.client.messages)
+  if(message.topic=="homeassistant/sensor/FIRST-55/esp_ip/config")
+   clearedOldIdentity=message.payload.empty()&&message.retained;
+ assert(clearedOldIdentity);
+
+ // A failed attempt remains throttled for five seconds, with unsigned elapsed
+ // arithmetic allowing the retry window itself to cross millis() rollover.
+ a.appConfig.mqttTopic="RETRY";a.client.publishOK=false;
+ fake::ticks=static_cast<uint64_t>(UINT32_MAX)-2000;
+ a.client.messages.clear();assert(!m.prepareDiscovery(a.appConfig));
+ const uint32_t failedAt=m.lastDiscoveryMigrationAttemptMillis;
+ a.client.publishOK=true;
+ assert(!m.prepareDiscovery(a.appConfig));
+ fake::ticks=static_cast<uint64_t>(failedAt)+4999;
+ assert(!m.prepareDiscovery(a.appConfig));
+ fake::ticks=static_cast<uint64_t>(failedAt)+5000;
+ assert(m.prepareDiscovery(a.appConfig));assert(m.discoveryIdentity=="RETRY-56");
+
+ a.appConfig=savedConfig;i.invData.Serial=savedSerial;fake::ticks=savedTicks;fake::nvs=savedNvs;
+ a.client.messages=savedMessages;a.client.online=savedOnline;a.client.publishOK=savedPublishOK;a.client.connectOK=savedConnectOK;
+ fake::nvsOpenFail=savedNvsOpenFail;fake::nvsReadFail=savedNvsReadFail;
+ fake::nvsBlobDataReadFail=savedNvsBlobDataReadFail;fake::nvsIdentityTypeMismatch=savedNvsIdentityTypeMismatch;
+ fake::nvsFail=savedNvsFail;
+ m.discoveryIdentityLoaded=savedIdentityLoaded;m.discoveryIdentity=savedIdentity;
+ m.discoveryMigrationAttempted=savedMigrationAttempted;m.lastDiscoveryMigrationAttemptMillis=savedLastAttempt;
+}
 
 
 int main(){
@@ -1231,16 +1496,26 @@ int main(){
  testBoundedHttpDeadline();
  testClockReplyCorrelation();
  testClockTargetsOneInverter();
+ testDiscoveryAfterReconnectAndBirth();
  testProvisioningTimeouts();
  testProvisionedWifiSurvivesStartup();
  testCompiledWifiProvisionedMarker();
+ testTopicValidationAndJsonEscaping();
+ testDiscoveryCapacity();
  testLoginAndInitCrc();
  testLoginFiltersSenderAndKnownSerial();
  testLoginBoundsUnrelatedReplies();
  testSenderAddressMatching();
  testLogoffRetriesCrcCollision();
+ testEnergyPersistenceRetries();
+ testEnergyFenceSurvivesReboot();
+ testEnergyLegacyMigration();
+ testEnergyStorageReadFailures();
+ testReplacingInverterResetsEnergyBaseline();
+ testEnergyFilteringDoesNotHidePower();
  testUnsupportedTemperature();
  testDcChannels();
+ testSignedAndUnavailableMeasurements();
  testStatusRecordBounds();
  testMalformedRecordRanges();
  testFragmentEscapes();
@@ -1263,11 +1538,14 @@ int main(){
  testManyValidFragments();
  testCflAttemptsAreTransactional();
  testBluetoothWriteFailureAndSignalValidity();
+ testEmptyStatusIsUnavailable();
  testInitReplyAndTrailerBounds();
  testInitRefreshesModelWhenSerialChanges();
  testClockExpiresDuringRead();
  testConnectRetainsEarlyHandshakeAndCleansFailedSession();
  testBluetoothAuthRecoveryMatchesTargetPeer();
+ testDiscoveryIdentityCleanup();
+ testDiscoveryMigrationLongUptimeAndRollover();
  testNumericSettingsValidation();
  testTimezoneConfigurationReload();
  testWebBasicAuthentication();

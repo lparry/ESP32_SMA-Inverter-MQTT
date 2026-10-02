@@ -630,15 +630,9 @@ void ESP32_SMA_MQTT::wifiStartup(){
   if (config.mqttTopic == "")
     config.mqttTopic = mqttInstance.sapString;
 
-  Preferences energyStore;
-  if (energyStore.begin("sma-mqtt", true)) {
-    uint32_t savedSerial = energyStore.getUInt("serial", 0);
-    if (savedSerial != 0 && savedSerial == config.thisSerial) {
-      lastAcceptedETotalWh = energyStore.getULong64("etotal", 0);
-      lastPersistedETotalWh = lastAcceptedETotalWh;
-    }
-    energyStore.end();
-  }
+  loadEnergyBaseline(config.thisSerial);
+  // Capture the previous discovery identity before the web UI can save changes.
+  loadDiscoveryIdentity();
   ESP32_SMA_Inverter_App::smartConfig = 0;
   String hostName = mqttInstance.sapString;
   logW("hostname %s", hostName.c_str());
@@ -866,6 +860,7 @@ void ESP32_SMA_MQTT::wifiLoop(bool receiveWait){
     // Bluetooth reply is outstanding so it cannot consume the reply deadline.
     // A long poll may miss MQTT keepalive; the next normal pass can reconnect.
     if (!receiveWait) {
+      prepareDiscovery(ESP32_SMA_Inverter_App::getInstance().appConfig);
       publishEspStatus(true);
       if (ESP32_SMA_Inverter_App::client.connected()) {
         ESP32_SMA_Inverter_App::client.loop();
