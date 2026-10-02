@@ -1,78 +1,79 @@
-name: Build Firmware
+name: Firmware and regression checks
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    name: Build Firmware
     runs-on: ubuntu-latest
-
+    strategy:
+      matrix:
+        configuration: [defaults, example, partial]
+    env:
+      CXX: clang++
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v2
-
-      - name: Rename Config File
-        run: |
-          mv src/Config_example.h src/config_values.h
-
-      - name: Cache PlatformIO Dependencies
-        uses: actions/cache@v2
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/cache@v4
         with:
           path: ~/.platformio
-          key: ${{ runner.os }}-pio-${{ hashFiles('**/platformio.ini') }}
-          restore-keys: |
-            ${{ runner.os }}-pio-
-
-      - name: Set Up PlatformIO
+          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini') }}
+      - name: Install pinned build tools
+        run: python -m pip install platformio==6.1.19
+      - name: Select public configuration
+        shell: bash
         run: |
-          pip install -U platformio
-          pio upgrade --dev
-          pio update
-
-      - name: Build Firmware
+          case '${{ matrix.configuration }}' in
+            example) cp src/Config_example.h src/config_values.h ;;
+            partial) printf '#define SCAN_RATE 45\n' > src/config_values.h ;;
+          esac
+      - name: Build ESP32 firmware
         run: pio run --environment espwroom32
-  
-      - name: Get Latest Release Tag
-        id: get_latest_tag
-        run: echo "::set-output name=tag::$(git describe --abbrev=0 --tags)"
-  
-      - name: Extract Minor Version
-        id: extract_minor_version
-        run: echo "::set-output name=minor_version::$(echo ${{ steps.get_latest_tag.outputs.tag }} | cut -d. -f2)"
-
-      - name: Increment Minor Version
-        id: increment_minor_version
-        run: echo "::set-output name=incremented_minor_version::$((${{ steps.extract_minor_version.outputs.minor_version }} + 1))"
-
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
+      - name: Run host regression checks with sanitizers
+        if: matrix.configuration == 'defaults'
+        run: python tests/host/run.py
+      - name: Test firmware release idempotency
+        if: matrix.configuration == 'defaults'
+        run: python tests/release/test_publish_firmware_release.py
+      - uses: actions/upload-artifact@v4
         with:
-          tag_name: v1.${{ steps.increment_minor_version.outputs.incremented_minor_version }}.0
-          release_name: Release v1.${{ steps.increment_minor_version.outputs.incremented_minor_version }}.0
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.PLATFORMIO_RELEASE_TOKEN }}
+          name: firmware-${{ matrix.configuration }}
+          path: |
+            .pio/build/espwroom32/firmware.elf
+            .pio/build/espwroom32/firmware.bin
 
-      - name: Upload Firmware as Release Asset
-        uses: actions/upload-release-asset@v1
+  # Preserve automatic main-branch releases; pull requests only run checks.
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    # Keep pending publications instead of letting a late matrix run replace one.
+    # GitHub's queue: max allows up to 100 pending runs; see the concurrency docs.
+    concurrency:
+      group: firmware-release
+      queue: max
+    steps:
+      - uses: actions/checkout@v4
         with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: .pio/build/espwroom32/firmware.elf
-          asset_name: firmware.elf
-          asset_content_type: application/octet-stream
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          name: firmware-defaults
+          path: firmware
+      - name: Publish the next minor release
         env:
-            GITHUB_TOKEN: ${{ secrets.PLATFORMIO_RELEASE_TOKEN }}
-  
-      - name: Cleanup Old Artifacts
-        run: |
-            find .pio/build -type f -name "*.elf" | sort -r | tail -n +6 | xargs rm -f
-
-            
+          GH_TOKEN: ${{ secrets.PLATFORMIO_RELEASE_TOKEN }}
+        run: python scripts/publish_firmware_release.py
