@@ -217,7 +217,104 @@ static void assertBasicChallenge(const AppHttpResponse&response){
  assert(challenge->second=="Basic realm=\"Login Required\"");
 }
 
+void testWebBasicAuthentication(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();
+ const AppConfig savedConfig=a.appConfig;
+ const String savedSettingsToken=m.settingsToken,savedClockToken=m.clockSyncToken,savedSmartToken=m.smartConfigToken;
+ const bool savedClockRequest=a.clockSyncRequested;const uint32_t savedClockDeadline=a.clockSyncRequestDeadline;
+ const uint32_t savedNextTime=a.nextTime;const String savedClockStatus=a.clockSyncStatus;
+ const unsigned oldAuthenticateCalls=a.webServer.authenticateCalls;const bool oldAuthenticateResult=a.webServer.auth;
+ const int savedWifiState=WiFi.state;const bool savedSmartConfigStart=WiFi.smartConfigStartResult;
+ const bool savedSmartConfigDone=WiFi.done;const bool savedPersistent=WiFi.persistentEnabled;
+ const bool savedAutoReconnect=WiFi.autoReconnectEnabled;const unsigned savedSmartConfigBegins=WiFi.smartConfigBegins;
+ const unsigned savedStops=WiFi.stops;
+ const std::string savedStationSSID=fake::stationSSID,savedStationPassword=fake::stationPassword;
+ const bool savedStationAssociated=fake::stationAssociated,savedWiFiConfigAvailable=fake::wifiConfigAvailable;
+ const bool savedWiFiConfigSetAvailable=fake::wifiConfigSetAvailable;
+ const auto savedNvs=fake::nvs;const bool savedNvsFail=fake::nvsFail,savedNvsOpenFail=fake::nvsOpenFail;
+ const bool savedNvsReadFail=fake::nvsReadFail;const std::string savedFailReadKey=fake::nvsFailReadKey;
+ const uint64_t savedTicks=fake::ticks;
 
+ auto&server=a.webServer;server.begin();
+ a.appConfig.mqttUser="u";a.appConfig.mqttPasswd="p";
+ m.settingsToken="settings-csrf";m.clockSyncToken="clock-csrf";m.smartConfigToken="smart-csrf";
+ server.auth=false; // Valid headers must pass without the unsafe core authenticate() overload.
+ assert(base64ForHttpTest("u:p")=="dTpw");
+ const std::string shortAuth="Basic "+base64ForHttpTest("u:p");
+ auto missing=appHttpRequest("GET","/smartconfig","",nullptr);assertBasicChallenge(missing);
+ const std::string wrongAuth="Basic "+base64ForHttpTest("u:wrong");
+ assertBasicChallenge(appHttpRequest("GET","/smartconfig","",&wrongAuth));
+ const std::string wrongScheme="Bearer "+base64ForHttpTest("u:p");
+ assertBasicChallenge(appHttpRequest("GET","/smartconfig","",&wrongScheme));
+ const std::string malformed="Basic ???";
+ assertBasicChallenge(appHttpRequest("GET","/smartconfig","",&malformed));
+ assert(appHttpRequest("GET","/smartconfig","",&shortAuth).code==200);
+ const std::string trimmedMixedCase="  bAsIc    "+base64ForHttpTest("u:p")+" \t";
+ assert(appHttpRequest("GET","/smartconfig","",&trimmedMixedCase).code==200);
+ std::string changedCase=shortAuth;changedCase[6]='D';
+ assertBasicChallenge(appHttpRequest("GET","/smartconfig","",&changedCase));
+
+ // The settings/status page remains public by design; authenticated writes
+ // still require both Basic credentials and their independent CSRF token.
+ assert(appHttpRequest("GET","/","",nullptr).code==200);
+ const std::string settingsBody="token=settings-csrf&mqttPort=0";
+ assertBasicChallenge(appHttpRequest("POST","/postform/",settingsBody,nullptr));
+ assert(appHttpRequest("POST","/postform/",settingsBody,&shortAuth).code==400);
+ assertBasicChallenge(appHttpRequest("POST","/setclock/","token=clock-csrf",nullptr));
+ const auto clockRejected=appHttpRequest("POST","/setclock/","token=wrong",&shortAuth);
+ assert(clockRejected.code==403);
+ assertBasicChallenge(appHttpRequest("GET","/smartconfig","",nullptr));
+ assertBasicChallenge(appHttpRequest("POST","/smartconfig","token=smart-csrf",nullptr));
+ assert(appHttpRequest("POST","/smartconfig","token=wrong",&shortAuth).code==403);
+
+ // Both maximum GUI credential lengths must survive canonical Base64 padding.
+ const std::string user127(127,'u'),password128(128,'p');
+ a.appConfig.mqttUser=user127;a.appConfig.mqttPasswd=password128;
+ std::string auth127="Basic "+base64ForHttpTest(user127+":"+password128);
+ assert(auth127.size()>7&&auth127.substr(auth127.size()-2)=="==");
+ assert(appHttpRequest("GET","/smartconfig","",&auth127).code==200);
+ std::string badDoublePadding=auth127;badDoublePadding.back()='A';
+ assertBasicChallenge(appHttpRequest("GET","/smartconfig","",&badDoublePadding));
+
+ const std::string user128(128,'u');
+ a.appConfig.mqttUser=user128;a.appConfig.mqttPasswd=password128;
+ std::string auth128="Basic "+base64ForHttpTest(user128+":"+password128);
+ assert(auth128.back()=='=');
+ assert(appHttpRequest("GET","/smartconfig","",&auth128).code==200);
+ std::string missingPadding=auth128.substr(0,auth128.size()-1);
+ assertBasicChallenge(appHttpRequest("GET","/smartconfig","",&missingPadding));
+
+ // Valid Basic + valid CSRF reaches the clock handler. SmartConfig also
+ // reaches its action path, but the fake start failure keeps the test bounded.
+ a.appConfig.mqttUser="u";a.appConfig.mqttPasswd="p";
+ const auto clockAccepted=appHttpRequest("POST","/setclock/","token=clock-csrf",&shortAuth);
+ assert(clockAccepted.code==202);
+ WiFi.state=0;fake::stationSSID.clear();fake::stationPassword.clear();fake::stationAssociated=false;
+ fake::wifiConfigAvailable=fake::wifiConfigSetAvailable=true;fake::nvs.clear();
+ fake::nvsFail=fake::nvsOpenFail=fake::nvsReadFail=false;fake::nvsFailReadKey.clear();
+ WiFi.smartConfigStartResult=false;WiFi.done=false;
+ const auto smartAccepted=appHttpRequest("POST","/smartconfig","token=smart-csrf",&shortAuth);
+ assert(smartAccepted.code==200);
+
+ // Empty MQTT username intentionally retains the existing bootstrap access.
+ a.appConfig.mqttUser="";
+ assert(appHttpRequest("POST","/postform/",settingsBody,nullptr).code==400);
+ assert(server.authenticateCalls==oldAuthenticateCalls);
+
+ a.appConfig=savedConfig;m.settingsToken=savedSettingsToken;
+ m.clockSyncToken=savedClockToken;m.smartConfigToken=savedSmartToken;
+ a.clockSyncRequested=savedClockRequest;a.clockSyncRequestDeadline=savedClockDeadline;
+ a.nextTime=savedNextTime;a.clockSyncStatus=savedClockStatus;server.auth=oldAuthenticateResult;
+ WiFi.state=savedWifiState;WiFi.smartConfigStartResult=savedSmartConfigStart;
+ WiFi.done=savedSmartConfigDone;WiFi.persistentEnabled=savedPersistent;
+ WiFi.autoReconnectEnabled=savedAutoReconnect;WiFi.smartConfigBegins=savedSmartConfigBegins;
+ WiFi.stops=savedStops;fake::stationSSID=savedStationSSID;fake::stationPassword=savedStationPassword;
+ fake::stationAssociated=savedStationAssociated;fake::wifiConfigAvailable=savedWiFiConfigAvailable;
+ fake::wifiConfigSetAvailable=savedWiFiConfigSetAvailable;fake::nvs=savedNvs;
+ fake::nvsFail=savedNvsFail;fake::nvsOpenFail=savedNvsOpenFail;fake::nvsReadFail=savedNvsReadFail;
+ fake::nvsFailReadKey=savedFailReadKey;fake::ticks=savedTicks;
+ server.close();
+}
 
 void testNumericSettingsValidation(){
  auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&w=a.webServer;
@@ -408,7 +505,12 @@ void testBoundedHttpDeadline(){
  }
 }
 
-
+void testLateWifiStartsNtp(){
+ auto&m=ESP32_SMA_MQTT::getInstance();m.ntpStarted=false;fake::ntpCalls=0;
+ WiFi.state=0;m.wifiLoop();assert(fake::ntpCalls==0);
+ WiFi.state=WL_CONNECTED;m.wifiLoop();assert(fake::ntpCalls==1);
+ m.wifiLoop();assert(fake::ntpCalls==1);
+}
 
 
 
@@ -706,9 +808,96 @@ void testLogoffRetriesCrcCollision(){
 }
 
 
+void testProvisionedWifiSurvivesStartup(){
+ auto&m=ESP32_SMA_MQTT::getInstance();fake::nvs.clear();WiFi.state=WL_CONNECTED;
+ WiFi.compiledBegins=WiFi.storedBegins=0;m.wifiStartup();assert(WiFi.compiledBegins==1);
+ try {m.mySmartConfig();assert(false);}catch(const fake::Restart&){}
+ Preferences store;store.begin("sma-wifi",true);assert(store.getBool("provisioned"));
+ auto compiled=WiFi.compiledBegins,stored=WiFi.storedBegins;m.wifiStartup();
+ assert(WiFi.compiledBegins==compiled);assert(WiFi.storedBegins==stored+1);assert(WiFi.persistentEnabled);
+ fake::nvs.clear();
+}
+void testCompiledWifiProvisionedMarker(){
+ auto&m=ESP32_SMA_MQTT::getInstance();
+ const auto savedNvs=fake::nvs;const bool savedNvsOpenFail=fake::nvsOpenFail,savedNvsReadFail=fake::nvsReadFail;
+ const auto savedNvsFailReadKey=fake::nvsFailReadKey;
+ const auto savedSSID=fake::stationSSID,savedPassword=fake::stationPassword;
+ const bool savedAssociated=fake::stationAssociated;const int savedWifiState=WiFi.state;
+ const unsigned savedCompiledBegins=WiFi.compiledBegins,savedStoredBegins=WiFi.storedBegins;
+ const bool savedAutoReconnect=WiFi.autoReconnectEnabled,savedPersistent=WiFi.persistentEnabled;
+ auto reset=[&](const char*ssid,const char*password){
+  fake::nvs.clear();fake::nvsOpenFail=fake::nvsReadFail=false;fake::nvsFailReadKey.clear();
+  fake::stationSSID=ssid;fake::stationPassword=password;fake::stationAssociated=false;
+  WiFi.state=WL_CONNECTED;WiFi.compiledBegins=WiFi.storedBegins=0;
+ };
+ auto startup=[&]{m.wifiStartup();};
+ const auto previousSSID=std::string("previous-network"),previousPassword=std::string("previous-password");
 
+ // Missing namespace/key is first setup, as is an explicit false marker.
+ reset(previousSSID.c_str(),previousPassword.c_str());
+ startup();assert(WiFi.compiledBegins==1&&WiFi.storedBegins==0);
+ assert(fake::stationSSID==WIFI_SSID&&fake::stationPassword==WIFI_PASSWORD);
 
+ // A missing key in an otherwise existing namespace is also first setup.
+ reset(previousSSID.c_str(),previousPassword.c_str());
+ Preferences unrelated;assert(unrelated.begin("sma-wifi",false));assert(unrelated.putUInt("other",42)==sizeof(uint32_t));unrelated.end();
+ startup();assert(WiFi.compiledBegins==1&&WiFi.storedBegins==0);
+ assert(fake::stationSSID==WIFI_SSID&&fake::stationPassword==WIFI_PASSWORD);
 
+ reset(previousSSID.c_str(),previousPassword.c_str());
+ Preferences marker;assert(marker.begin("sma-wifi",false));assert(marker.putBool("provisioned",false)==sizeof(bool));marker.end();
+ startup();assert(WiFi.compiledBegins==1&&WiFi.storedBegins==0);
+ assert(fake::stationSSID==WIFI_SSID&&fake::stationPassword==WIFI_PASSWORD);
+
+ // A true marker retains the driver-owned, already provisioned network.
+ reset(previousSSID.c_str(),previousPassword.c_str());
+ assert(marker.begin("sma-wifi",false));assert(marker.putBool("provisioned",true)==sizeof(bool));marker.end();
+ startup();assert(WiFi.compiledBegins==0&&WiFi.storedBegins==1);
+ assert(fake::stationSSID==previousSSID&&fake::stationPassword==previousPassword);
+
+ // Open/read/type/value errors are ambiguous: retry the saved network without
+ // writing the compiled credentials over it, while keeping startup bounded.
+ reset(previousSSID.c_str(),previousPassword.c_str());
+ assert(marker.begin("sma-wifi",false));assert(marker.putBool("provisioned",true)==sizeof(bool));marker.end();
+ fake::nvsOpenFail=true;
+ startup();
+ assert(WiFi.compiledBegins==0);
+ assert(fake::stationSSID==previousSSID&&fake::stationPassword==previousPassword);
+
+ reset(previousSSID.c_str(),previousPassword.c_str());
+ assert(marker.begin("sma-wifi",false));assert(marker.putBool("provisioned",true)==sizeof(bool));marker.end();
+ fake::nvsFailReadKey="sma-wifi/provisioned";WiFi.state=0;const uint64_t readFailureStart=fake::ticks;
+ startup();assert(fake::ticks-readFailureStart>=60000&&fake::ticks-readFailureStart<65000);
+ assert(WiFi.compiledBegins==0&&WiFi.storedBegins==1);
+ assert(WiFi.autoReconnectEnabled);
+ assert(fake::stationSSID==previousSSID&&fake::stationPassword==previousPassword);
+
+ reset(previousSSID.c_str(),previousPassword.c_str());
+ uint32_t wrongType=1;assert(marker.begin("sma-wifi",false));assert(marker.putUInt("provisioned",wrongType)==sizeof(wrongType));marker.end();
+ startup();assert(WiFi.compiledBegins==0&&WiFi.storedBegins==1);
+ assert(fake::stationSSID==previousSSID&&fake::stationPassword==previousPassword);
+
+ reset(previousSSID.c_str(),previousPassword.c_str());
+ const uint8_t invalidValue=2;assert(marker.begin("sma-wifi",false));assert(marker.putBytes("provisioned",&invalidValue,sizeof(invalidValue))==sizeof(invalidValue));marker.end();
+ startup();assert(WiFi.compiledBegins==0&&WiFi.storedBegins==1);
+ assert(fake::stationSSID==previousSSID&&fake::stationPassword==previousPassword);
+ fake::nvsOpenFail=fake::nvsReadFail=false;fake::nvsFailReadKey=savedNvsFailReadKey;
+ fake::nvs=savedNvs;fake::nvsOpenFail=savedNvsOpenFail;fake::nvsReadFail=savedNvsReadFail;
+ fake::stationSSID=savedSSID;fake::stationPassword=savedPassword;fake::stationAssociated=savedAssociated;
+ WiFi.state=savedWifiState;WiFi.compiledBegins=savedCompiledBegins;WiFi.storedBegins=savedStoredBegins;
+ WiFi.autoReconnectEnabled=savedAutoReconnect;WiFi.persistentEnabled=savedPersistent;
+}
+void testProvisioningTimeouts(){
+ auto&m=ESP32_SMA_MQTT::getInstance();fake::nvs.clear();WiFi.state=0;
+ for(bool received:{true,false}){
+  fake::stationSSID="previous-network";fake::stationPassword="previous-password";
+  WiFi.done=received;WiFi.lastSSID="";auto start=fake::ticks;auto stops=WiFi.stops;
+  m.mySmartConfig();assert(fake::ticks-start<(received?65000:485000));assert(WiFi.stops==stops+1);
+  assert(WiFi.lastSSID=="previous-network");assert(WiFi.SSID().isEmpty());
+  assert(fake::stationSSID=="previous-network");Preferences store;store.begin("sma-wifi",true);assert(!store.getBool("provisioned"));
+ }
+ WiFi.done=true;WiFi.state=WL_CONNECTED;
+}
 
 void testClockReplyCorrelation(){
  auto&i=ESP32_SMA_Inverter::getInstance();auto&b=i.serialBT;i.invData.SUSyID=0x1234;i.invData.Serial=55;
@@ -1042,6 +1231,9 @@ int main(){
  testBoundedHttpDeadline();
  testClockReplyCorrelation();
  testClockTargetsOneInverter();
+ testProvisioningTimeouts();
+ testProvisionedWifiSurvivesStartup();
+ testCompiledWifiProvisionedMarker();
  testLoginAndInitCrc();
  testLoginFiltersSenderAndKnownSerial();
  testLoginBoundsUnrelatedReplies();
@@ -1055,6 +1247,7 @@ int main(){
  testSlowPacketDeadline();
  testCallerOperationDeadlinesAndRollover();
  testBluetoothTimerRollover();
+ testLateWifiStartsNtp();
  testExcessFormArguments();
  testSettingsToken();
  testNtpInput();
@@ -1077,6 +1270,7 @@ int main(){
  testBluetoothAuthRecoveryMatchesTargetPeer();
  testNumericSettingsValidation();
  testTimezoneConfigurationReload();
+ testWebBasicAuthentication();
  InverterData identity{}; identity.SUSyID=0x1234; assert(identity.SUSyID==0x1234);
  uint8_t bytes[]={0x78,0x56,0x34,0x12,0,0,0,0};
  assert(get_u16(bytes)==0x5678);

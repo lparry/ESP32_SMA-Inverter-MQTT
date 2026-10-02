@@ -31,3 +31,19 @@ with tempfile.TemporaryDirectory(prefix='sma-host-') as tmp:
            *[str(sources/n) for n in ('SMA_Utils.cpp','BluetoothAuthObserver.cpp','SMA_Inverter.cpp','ESP32_SMA_Inverter_App.cpp','ESP32_SMA_MQTT.cpp')],str(ROOT/'tests/host/gap_sdk_fake.cpp'),str(ROOT/'tests/host/test.cpp'),'-o',str(tmp/'tests')]
     subprocess.run(cmd,check=True)
     subprocess.run([str(tmp/'tests')],check=True)
+
+    # Compile the real startup path again without WIFI_SSID so saved-network
+    # and first-time provisioning behavior are both covered.
+    no_ssid_sources = tmp/'no-ssid-src'
+    no_ssid_sources.mkdir()
+    for f in (ROOT/'src').iterdir():
+        if f.suffix in ('.cpp','.h') and f.name not in ('config_values.h','Config.h'):
+            shutil.copy(f,no_ssid_sources/f.name)
+    no_ssid_cmd = [os.environ.get('CXX','c++'),'-std=c++17','-pthread','-Wno-register','-Werror=format','-Wno-deprecated-declarations','-Wno-parentheses-equality','-Wno-comment','-g','-fno-access-control',
+           '-fsanitize=address,undefined','-fno-omit-frame-pointer',
+           '-DARDUINOJSON_ENABLE_ARDUINO_STRING=1','-DARDUINOJSON_ENABLE_ARDUINO_STREAM=0',
+           '-DARDUINOJSON_ENABLE_ARDUINO_PRINT=0',
+           '-I'+str(ROOT/'tests/host/stubs'),'-I'+str(no_ssid_sources),'-I'+str(JSON),
+           *[str(no_ssid_sources/n) for n in ('SMA_Utils.cpp','BluetoothAuthObserver.cpp','SMA_Inverter.cpp','ESP32_SMA_Inverter_App.cpp','ESP32_SMA_MQTT.cpp')],str(ROOT/'tests/host/gap_sdk_fake.cpp'),str(ROOT/'tests/host/wifi_startup.cpp'),'-o',str(tmp/'wifi-startup-tests')]
+    subprocess.run(no_ssid_cmd,check=True)
+    subprocess.run([str(tmp/'wifi-startup-tests')],check=True)

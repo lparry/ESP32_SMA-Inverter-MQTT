@@ -125,6 +125,278 @@ static bool validHostname(const String& value) {
   return value[value.length() - 1] != '-';
 }
 
+static bool loadStoredWiFiCredentials(String& ssid, String& password, bool *configRead = nullptr) {
+  if (configRead) *configRead = false;
+  wifi_config_t stationConfig = {};
+  if (esp_wifi_get_config(WIFI_IF_STA, &stationConfig) != ESP_OK) return false;
+  if (configRead) *configRead = true;
+
+  char ssidBuffer[sizeof(stationConfig.sta.ssid) + 1] = {};
+  char passwordBuffer[sizeof(stationConfig.sta.password) + 1] = {};
+  memcpy(ssidBuffer, stationConfig.sta.ssid, sizeof(stationConfig.sta.ssid));
+  memcpy(passwordBuffer, stationConfig.sta.password, sizeof(stationConfig.sta.password));
+  if (ssidBuffer[0] == '\0') return false;
+
+  ssid = String(ssidBuffer);
+  password = String(passwordBuffer);
+  return true;
+}
+
+// A missing marker means this is a first setup; an NVS error is ambiguous and
+// must not replace credentials that may already have been provisioned.
+static bool loadProvisionedWiFiFlag(bool& provisioned) {
+  provisioned = false;
+  nvs_handle_t store;
+  const esp_err_t openResult = nvs_open("sma-wifi", NVS_READONLY, &store);
+  if (openResult == ESP_ERR_NVS_NOT_FOUND) return true;
+  if (openResult != ESP_OK) {
+    log_w("Could not open Wi-Fi setup state (NVS error %d)", static_cast<int>(openResult));
+    return false;
+  }
+
+  uint8_t storedValue = 0;
+  const esp_err_t readResult = nvs_get_u8(store, "provisioned", &storedValue);
+  nvs_close(store);
+  if (readResult == ESP_ERR_NVS_NOT_FOUND) return true;
+  if (readResult != ESP_OK) {
+    log_w("Could not read Wi-Fi setup state (NVS error %d)", static_cast<int>(readResult));
+    return false;
+  }
+  if (storedValue > 1) {
+    log_w("Invalid Wi-Fi setup state; preserving saved station credentials");
+    return false;
+  }
+  provisioned = storedValue == 1;
+  return true;
+}
+
+struct WiFiProvisioningJournal {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  uint8_t priorHasCredentials;
+  uint8_t priorProvisioned;
+  uint8_t reserved[2];
+  uint8_t priorSSID[32];
+  uint8_t priorPassword[64];
+  uint32_t checksum;
+};
+
+static constexpr uint32_t WIFI_PROVISIONING_JOURNAL_MAGIC = 0x534D4157UL;
+static constexpr uint16_t WIFI_PROVISIONING_JOURNAL_VERSION = 1;
+static constexpr const char *WIFI_PROVISIONING_NVS_NAMESPACE = "sma-wifi";
+static constexpr const char *WIFI_PROVISIONING_JOURNAL_KEY = "sc-journal";
+
+static uint32_t wifiProvisioningJournalChecksum(const WiFiProvisioningJournal& journal) {
+  const uint8_t *bytes = reinterpret_cast<const uint8_t*>(&journal);
+  uint32_t checksum = 2166136261UL;
+  for (size_t i = 0; i < offsetof(WiFiProvisioningJournal, checksum); ++i) {
+    checksum = (checksum ^ bytes[i]) * 16777619UL;
+  }
+  return checksum;
+}
+
+static bool writeProvisionedFlag(bool provisioned) {
+  nvs_handle_t store;
+  if (nvs_open(WIFI_PROVISIONING_NVS_NAMESPACE, NVS_READWRITE, &store) != ESP_OK) return false;
+  esp_err_t result = ESP_OK;
+  if (provisioned) {
+    result = nvs_set_u8(store, "provisioned", 1);
+  } else {
+    result = nvs_erase_key(store, "provisioned");
+    if (result == ESP_ERR_NVS_NOT_FOUND) result = ESP_OK;
+  }
+  if (result == ESP_OK) result = nvs_commit(store);
+  nvs_close(store);
+  return result == ESP_OK;
+}
+
+static bool readWiFiProvisioningJournal(WiFiProvisioningJournal& journal, bool& found) {
+  found = false;
+  nvs_handle_t store;
+  const esp_err_t openResult = nvs_open(WIFI_PROVISIONING_NVS_NAMESPACE, NVS_READONLY, &store);
+  if (openResult == ESP_ERR_NVS_NOT_FOUND) return true;
+  if (openResult != ESP_OK) return false;
+
+  size_t length = 0;
+  esp_err_t result = nvs_get_blob(store, WIFI_PROVISIONING_JOURNAL_KEY, nullptr, &length);
+  if (result == ESP_ERR_NVS_NOT_FOUND) {
+    nvs_close(store);
+    return true;
+  }
+  if (result != ESP_OK || length != sizeof(journal)) {
+    nvs_close(store);
+    return false;
+  }
+  result = nvs_get_blob(store, WIFI_PROVISIONING_JOURNAL_KEY, &journal, &length);
+  nvs_close(store);
+  if (result != ESP_OK || length != sizeof(journal) ||
+      journal.magic != WIFI_PROVISIONING_JOURNAL_MAGIC ||
+      journal.version != WIFI_PROVISIONING_JOURNAL_VERSION || journal.size != sizeof(journal) ||
+      journal.priorHasCredentials > 1 || journal.priorProvisioned > 1 ||
+      journal.checksum != wifiProvisioningJournalChecksum(journal)) return false;
+  found = true;
+  return true;
+}
+
+static bool saveWiFiProvisioningJournal(const wifi_config_t& priorConfig, bool priorProvisioned,
+                                       WiFiProvisioningJournal& journal) {
+  journal = {};
+  journal.magic = WIFI_PROVISIONING_JOURNAL_MAGIC;
+  journal.version = WIFI_PROVISIONING_JOURNAL_VERSION;
+  journal.size = sizeof(journal);
+  journal.priorProvisioned = priorProvisioned ? 1 : 0;
+  if (priorConfig.sta.ssid[0] != '\0') {
+    journal.priorHasCredentials = 1;
+    memcpy(journal.priorSSID, priorConfig.sta.ssid, sizeof(journal.priorSSID));
+    memcpy(journal.priorPassword, priorConfig.sta.password, sizeof(journal.priorPassword));
+  }
+  journal.checksum = wifiProvisioningJournalChecksum(journal);
+
+  nvs_handle_t store;
+  if (nvs_open(WIFI_PROVISIONING_NVS_NAMESPACE, NVS_READWRITE, &store) != ESP_OK) return false;
+  bool saved = nvs_set_blob(store, WIFI_PROVISIONING_JOURNAL_KEY, &journal, sizeof(journal)) == ESP_OK;
+  if (saved) saved = nvs_commit(store) == ESP_OK;
+  nvs_close(store);
+  return saved;
+}
+
+static bool clearWiFiProvisioningJournal() {
+  nvs_handle_t store;
+  if (nvs_open(WIFI_PROVISIONING_NVS_NAMESPACE, NVS_READWRITE, &store) != ESP_OK) return false;
+  esp_err_t result = nvs_erase_key(store, WIFI_PROVISIONING_JOURNAL_KEY);
+  if (result == ESP_ERR_NVS_NOT_FOUND) result = ESP_OK;
+  if (result == ESP_OK) result = nvs_commit(store);
+  nvs_close(store);
+  return result == ESP_OK;
+}
+
+static bool restorePriorWiFiConfig(const WiFiProvisioningJournal& journal) {
+  if (esp_wifi_disconnect() != ESP_OK) return false;
+  wifi_config_t stationConfig = {};
+  if (journal.priorHasCredentials) {
+    memcpy(stationConfig.sta.ssid, journal.priorSSID, sizeof(stationConfig.sta.ssid));
+    memcpy(stationConfig.sta.password, journal.priorPassword, sizeof(stationConfig.sta.password));
+  }
+  return esp_wifi_set_config(WIFI_IF_STA, &stationConfig) == ESP_OK;
+}
+
+static bool recoverInterruptedWiFiProvisioning() {
+  WiFiProvisioningJournal journal = {};
+  bool found = false;
+  if (!readWiFiProvisioningJournal(journal, found)) {
+    log_e("Cannot read Wi-Fi recovery journal; station startup is deferred");
+    return false;
+  }
+  if (!found) return true;
+  if (!restorePriorWiFiConfig(journal) || !writeProvisionedFlag(journal.priorProvisioned) ||
+      !clearWiFiProvisioningJournal()) {
+    log_e("Cannot restore interrupted Wi-Fi setup; station startup is deferred");
+    return false;
+  }
+  log_w("Recovered the previous Wi-Fi setup after an interrupted provisioning attempt");
+  return true;
+}
+
+static bool wifiStartupRecoveryPending = false;
+static uint32_t wifiRecoveryRetryAt = 0;
+static uint32_t wifiRecoveryRetryDelay = 5000UL;
+
+#ifndef WIFI_SSID
+static constexpr uint32_t WIFI_EMPTY_BOOTSTRAP_RETRY_INITIAL_MS = 60000UL;
+static constexpr uint32_t WIFI_EMPTY_BOOTSTRAP_RETRY_MAX_MS = 300000UL;
+static bool wifiEmptyBootstrapRetryPending = false;
+static uint32_t wifiEmptyBootstrapRetryAt = 0;
+static uint32_t wifiEmptyBootstrapRetryDelay = WIFI_EMPTY_BOOTSTRAP_RETRY_INITIAL_MS;
+
+static void clearEmptyWiFiBootstrapRetry() {
+  wifiEmptyBootstrapRetryPending = false;
+  wifiEmptyBootstrapRetryDelay = WIFI_EMPTY_BOOTSTRAP_RETRY_INITIAL_MS;
+}
+
+static void scheduleEmptyWiFiBootstrapRetry() {
+  wifiEmptyBootstrapRetryPending = true;
+  wifiEmptyBootstrapRetryAt = millis();
+  log_i("No saved WiFi credentials; SmartConfig retry scheduled in %lu seconds",
+        static_cast<unsigned long>(wifiEmptyBootstrapRetryDelay / 1000UL));
+}
+
+static void increaseEmptyWiFiBootstrapRetryDelay() {
+  if (wifiEmptyBootstrapRetryDelay >= WIFI_EMPTY_BOOTSTRAP_RETRY_MAX_MS / 2) {
+    wifiEmptyBootstrapRetryDelay = WIFI_EMPTY_BOOTSTRAP_RETRY_MAX_MS;
+  } else {
+    wifiEmptyBootstrapRetryDelay *= 2;
+  }
+}
+
+static void serviceEmptyWiFiBootstrapRetry(bool receiveWait) {
+  if (!wifiEmptyBootstrapRetryPending || receiveWait ||
+      ESP32_SMA_Inverter_App::getInstance().isPolling()) return;
+
+  const uint32_t now = millis();
+  if (static_cast<uint32_t>(now - wifiEmptyBootstrapRetryAt) < wifiEmptyBootstrapRetryDelay) return;
+
+  // Recheck both sources of state before retrying. A driver read or marker
+  // read error is ambiguous, so leave the attempt pending with more backoff.
+  wifi_config_t stationConfig = {};
+  if (esp_wifi_get_config(WIFI_IF_STA, &stationConfig) != ESP_OK) {
+    log_w("Cannot retry WiFi setup: saved station credentials could not be read");
+    wifiEmptyBootstrapRetryAt = now;
+    increaseEmptyWiFiBootstrapRetryDelay();
+    return;
+  }
+  if (stationConfig.sta.ssid[0] != '\0') {
+    log_i("WiFi credentials appeared while provisioning was idle; canceling the empty-network retry");
+    clearEmptyWiFiBootstrapRetry();
+    return;
+  }
+
+  bool provisioned = false;
+  if (!loadProvisionedWiFiFlag(provisioned)) {
+    wifiEmptyBootstrapRetryAt = now;
+    increaseEmptyWiFiBootstrapRetryDelay();
+    return;
+  }
+
+  wifiEmptyBootstrapRetryPending = false;
+  increaseEmptyWiFiBootstrapRetryDelay();
+  log_i("Retrying SmartConfig for the confirmed empty station configuration");
+  ESP32_SMA_MQTT::getInstance().mySmartConfig();
+}
+#endif
+
+static void deferStationUntilWiFiRecovery() {
+#ifndef WIFI_SSID
+  // The journal/recovery path owns retries while station state is ambiguous.
+  wifiEmptyBootstrapRetryPending = false;
+#endif
+  wifiStartupRecoveryPending = true;
+  wifiRecoveryRetryAt = millis();
+  wifiRecoveryRetryDelay = 5000UL;
+  WiFi.setAutoReconnect(false);
+}
+
+static bool startStationAfterWiFiRecovery() {
+#ifdef WIFI_SSID
+  bool provisioned = false;
+  if (!loadProvisionedWiFiFlag(provisioned)) return false;
+  if (provisioned) WiFi.begin();
+  else WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+#else
+  String storedSSID;
+  String storedPassword;
+  bool stationConfigRead = false;
+  const bool hasStoredCredentials = loadStoredWiFiCredentials(storedSSID, storedPassword, &stationConfigRead);
+  if (!stationConfigRead) return false;
+  WiFi.begin();
+  if (!hasStoredCredentials) {
+    log_i("No saved WiFi credentials; starting SmartConfig provisioning");
+    ESP32_SMA_MQTT::getInstance().mySmartConfig();
+  }
+#endif
+  return true;
+}
+
 static bool isBasicWhitespace(char value) {
   return value == ' ' || value == '\t';
 }
@@ -247,6 +519,7 @@ void ESP32_SMA_MQTT::wifiTime() {
 
 
   configTime(gmtOffset_sec, daylightOffset_sec, config.ntphostname.c_str());
+  ntpStarted = true;
 
   String t = getTime();
   logI("Time %s" , t.c_str());
@@ -256,15 +529,10 @@ void ESP32_SMA_MQTT::wifiTime() {
 
 String ESP32_SMA_MQTT::getTime() {
   struct tm timeinfo;
-  for (int i=0;i<5;i++) {
-    logD(".time.");
-    if(getLocalTime(&timeinfo)) {
-      char charTime[64];
-      strftime(charTime, sizeof(charTime), "%A, %B %d %Y %H:%M:%S", &timeinfo);
-      logD("now : %s ", charTime);
-      return String(charTime);
-    }
-    delay(500);
+  if (getLocalTime(&timeinfo, 0)) {
+    char charTime[64];
+    strftime(charTime, sizeof(charTime), "%A, %B %d %Y %H:%M:%S", &timeinfo);
+    return String(charTime);
   }
   logE("failed to obtain time");
   return String("");
@@ -285,8 +553,22 @@ void ESP32_SMA_MQTT::wifiStartup(){
   settingsToken = String(token);
   logD("%s", mqttInstance.sapString.c_str());
 
-  // Attempt to connect to the AP stored on board, if not, start in SoftAP mode
+  // Start the station before initializing the inverter and MQTT.
+  WiFi.onEvent([this](WiFiEvent_t, WiFiEventInfo_t info) {
+    logW("WiFi disconnected, reason %u", static_cast<unsigned>(info.wifi_sta_disconnected.reason));
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   WiFi.mode(WIFI_STA);
+  const bool stationStartupAllowed = recoverInterruptedWiFiProvisioning();
+  wifiStartupRecoveryPending = !stationStartupAllowed;
+  wifiRecoveryRetryAt = millis();
+  wifiRecoveryRetryDelay = 5000UL;
+  WiFi.setAutoReconnect(stationStartupAllowed);
+  ESP32_SMA_Inverter_App::client.setCallback([this](char *topic, uint8_t *payload, unsigned int length) {
+    if (strcmp(topic, "homeassistant/status") == 0 && length == 6 && memcmp(payload, "online", 6) == 0) {
+      espDiscoveryPublished = false;
+      ESP32_SMA_Inverter_App::getInstance().requestDiscovery();
+    }
+  });
   ESP32_SMA_Inverter_App::client.setBufferSize(1024);
   ESP32_SMA_Inverter_App::client.setKeepAlive(120);
   ESP32_SMA_Inverter_App::client.setSocketTimeout(5);
@@ -295,17 +577,50 @@ void ESP32_SMA_MQTT::wifiStartup(){
   logD("setHostname");
   WiFi.hostname(mqttInstance.sapString);
 
+  if (!stationStartupAllowed) {
+    logW("Skipping station startup until Wi-Fi recovery storage is readable");
+  } else {
 #ifdef WIFI_SSID
-  //overriding ssid and hostname
+  // A configured device should retry its AP rather than wait for a phone
+  // provisioning packet before Bluetooth and the main loop can start.
   logD("wifi begin with ssid(%s) and password (.......)", WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  for (int w = 0; w <= 10 && WiFi.status() != WL_CONNECTED; w++) {
-    delay(500);
-    logD(".wifi.");
+  bool provisioned = false;
+  if (loadProvisionedWiFiFlag(provisioned)) {
+    if (provisioned) WiFi.begin();
+    else WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  } else {
+    // Keep the driver-owned credentials and let its bounded autoreconnect
+    // retry them when setup state cannot be read safely.
+    WiFi.begin();
+  }
+  const uint32_t wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 60000UL) {
+    delay(250);
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    logW("WiFi startup timed out (status %u); continuing with automatic reconnect", static_cast<unsigned>(WiFi.status()));
   }
 #else
   WiFi.begin();
+  String storedSSID;
+  String storedPassword;
+  bool stationConfigRead = false;
+  const bool hasStoredCredentials = loadStoredWiFiCredentials(storedSSID, storedPassword, &stationConfigRead);
+  const uint32_t startupWait = stationConfigRead && !hasStoredCredentials ? 4000UL : 60000UL;
+  const uint32_t wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < startupWait) {
+    delay(250);
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!stationConfigRead || hasStoredCredentials) {
+      logW("WiFi startup timed out (status %u); continuing with automatic reconnect", static_cast<unsigned>(WiFi.status()));
+    } else {
+      logI("No saved WiFi credentials; starting SmartConfig provisioning");
+      mySmartConfig();
+    }
+  }
 #endif
+  }
 
   //delay(2000);
   logD("Using config");
@@ -324,25 +639,17 @@ void ESP32_SMA_MQTT::wifiStartup(){
     }
     energyStore.end();
   }
-  int i = 0;
-  while (WiFi.status() != WL_CONNECTED) {
-    // Launch smartconfig to reconfigure wifi
-    logD(">");
-    if (i > 3)
-      mySmartConfig();
-    i++;
-    delay(1000);
-  }
-  // Success connecting
   ESP32_SMA_Inverter_App::smartConfig = 0;
   String hostName = mqttInstance.sapString;
   logW("hostname %s", hostName.c_str());
   logW("IP Address: %s", ((String)WiFi.localIP().toString()).c_str());
-  WiFi.setAutoReconnect(true);
+  WiFi.setAutoReconnect(stationStartupAllowed && !wifiStartupRecoveryPending);
   WiFi.persistent(true);
 
 
-  wifiTime();
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiTime();
+  }
 
 
   ESP32_SMA_Inverter_App::webServer.on("/", E_formPage);
@@ -358,23 +665,89 @@ void ESP32_SMA_MQTT::wifiStartup(){
 
 // Configure wifi using ESP Smartconfig app on phone
 void ESP32_SMA_MQTT::mySmartConfig() {
-  logD("smartConfig");
-  // Wipe current credentials
-  // WiFi.disconnect(true); // deletes the wifi credentials
-
   WiFi.mode(WIFI_STA);
+  if (!recoverInterruptedWiFiProvisioning()) {
+    deferStationUntilWiFiRecovery();
+    return;
+  }
+  wifiStartupRecoveryPending = false;
+
+  wifi_config_t previousConfig = {};
+  if (esp_wifi_get_config(WIFI_IF_STA, &previousConfig) != ESP_OK) {
+    // SmartConfig writes candidate credentials to the Wi-Fi driver's NVS as
+    // soon as they arrive, before association is known to have succeeded. Do
+    // not start it when we cannot snapshot the saved station configuration.
+    logE("Cannot start Wi-Fi provisioning: saved station credentials could not be read");
+    deferStationUntilWiFiRecovery();
+    return;
+  }
+  bool previousProvisioned = false;
+  if (!loadProvisionedWiFiFlag(previousProvisioned)) {
+    logE("Cannot start Wi-Fi provisioning: prior setup state could not be read");
+    deferStationUntilWiFiRecovery();
+    return;
+  }
+  WiFiProvisioningJournal priorJournal = {};
+  if (!saveWiFiProvisioningJournal(previousConfig, previousProvisioned, priorJournal)) {
+    logE("Cannot start Wi-Fi provisioning: recovery journal could not be saved");
+    deferStationUntilWiFiRecovery();
+    return;
+  }
+#ifndef WIFI_SSID
+  // A new explicit or automatic provisioning attempt supersedes an older
+  // idle retry. A later confirmed-empty rollback will schedule a fresh one.
+  wifiEmptyBootstrapRetryPending = false;
+#endif
+
+  const bool hadPreviousCredentials = previousConfig.sta.ssid[0] != '\0';
+  const uint32_t started = millis();
+  auto abandon = [&]() {
+    WiFi.stopSmartConfig();
+    if (!restorePriorWiFiConfig(priorJournal)) {
+      logE("Wi-Fi provisioning failed; saved station credentials could not be restored");
+      deferStationUntilWiFiRecovery();
+      return;
+    }
+    if (!writeProvisionedFlag(previousProvisioned)) {
+      logE("Wi-Fi provisioning failed; prior setup state could not be restored");
+      deferStationUntilWiFiRecovery();
+      return;
+    }
+    if (!clearWiFiProvisioningJournal()) {
+      logE("Wi-Fi provisioning failed; recovery journal could not be cleared");
+      deferStationUntilWiFiRecovery();
+      return;
+    }
+    if (hadPreviousCredentials) {
+      WiFi.begin();
+#ifndef WIFI_SSID
+      clearEmptyWiFiBootstrapRetry();
+#endif
+    }
+#ifndef WIFI_SSID
+    else scheduleEmptyWiFiBootstrapRetry();
+#endif
+    logE("Wi-Fi provisioning failed; restored the previous station configuration");
+  };
+  logD("smartConfig");
+
   delay(2000);
   WiFi.begin();
-  WiFi.beginSmartConfig();
+  WiFi.persistent(true); // ESPTouch must save credentials before reboot.
+  if (!WiFi.beginSmartConfig()) {
+    logE("Wi-Fi SmartConfig could not start");
+    abandon();
+    return;
+  }
 
   //Wait for SmartConfig packet from mobile
   logI("Waiting for SmartESP32_SMA_Inverter_App_Config::config");
-  // If no SmartConfig message arrives after about 8 minutes, reboot and try again.
-  int count = 0;
+  // If no SmartConfig message arrives after about 8 minutes, restore the
+  // previous station configuration and return to normal startup/recovery.
   while (!WiFi.smartConfigDone()) {
     delay(2000);
     logD(".");
-    if (count++ > 250 ) ESP.restart();
+    if ((uint32_t)(millis() - started) >= 480000UL) { abandon(); return; }
   }
   logD("");
   logI("SmartConfig received.");
@@ -382,20 +755,28 @@ void ESP32_SMA_MQTT::mySmartConfig() {
   //Wait for WiFi to connect to AP
   logW("Waiting for WiFi");
 
+  const uint32_t associationStarted = millis();
   while (WiFi.status() != WL_CONNECTED) {
+    if ((uint32_t)(millis() - associationStarted) >= 60000UL ||
+        (uint32_t)(millis() - started) >= 480000UL) { abandon(); return; }
     delay(500);
     logD(".");
   }
   logW("IP Address: %s", ((String)WiFi.localIP().toString()).c_str());
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
+  WiFi.stopSmartConfig();
+  if (!writeProvisionedFlag(true)) { abandon(); return; }
+  if (!clearWiFiProvisioningJournal()) { abandon(); return; }
+#ifndef WIFI_SSID
+  clearEmptyWiFiBootstrapRetry();
+#endif
   logW("Restarting in 5 seconds");
   delay(5000);
   ESP.restart();
 }
 
 void ESP32_SMA_MQTT::showSmartConfigConfirmation() {
-  if (!requireWebAuthentication()) return;
   if (!requireWebAuthentication()) return;
   String page =
     "<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
@@ -405,7 +786,9 @@ void ESP32_SMA_MQTT::showSmartConfigConfirmation() {
     "Use it only if you want to move the ESP32 to another Wi-Fi network.</p>"
     "<p>You need the ESPTouch app on a phone connected to the new network. "
     "Once started, inverter polling and MQTT updates pause, and this page may stop responding. "
-    "The ESP32 restarts after receiving the new settings or after about 8 minutes without them.</p>"
+    "Setup waits up to about 8 minutes for the phone and network. If the new network connects, "
+    "the ESP32 restarts. If setup times out or cannot connect, it restores the previous Wi-Fi "
+    "settings when available and resumes operation or retries setup.</p>"
     "<form method=\"post\" action=\"/smartconfig\">"
     "<input type=\"hidden\" name=\"token\" value=\"" + smartConfigToken + "\">"
     "<button type=\"submit\">Start Wi-Fi setup</button></form>"
@@ -417,7 +800,10 @@ void ESP32_SMA_MQTT::showSmartConfigConfirmation() {
 // Use ESP SmartConfig to connect to Wi-Fi only after the confirmation form is submitted.
 void ESP32_SMA_MQTT::connectAP(){
   if (!requireWebAuthentication()) return;
-  if (!requireWebAuthentication()) return;
+  if (ESP32_SMA_Inverter_App::getInstance().isPolling()) {
+    ESP32_SMA_Inverter_App::webServer.send(503, "text/plain", "Inverter read in progress; retry Wi-Fi setup shortly");
+    return;
+  }
   if (!ESP32_SMA_Inverter_App::webServer.hasArg("token") ||
       ESP32_SMA_Inverter_App::webServer.arg("token") != smartConfigToken) {
     ESP32_SMA_Inverter_App::webServer.send(403, "text/plain", "Invalid or expired request token");
@@ -425,7 +811,9 @@ void ESP32_SMA_MQTT::connectAP(){
   }
   ESP32_SMA_Inverter_App::webServer.send(200, "text/plain",
       "Wi-Fi setup started. Open the ESPTouch app on a phone connected to the new Wi-Fi network. "
-      "Inverter and MQTT updates are paused until the ESP32 restarts.");
+      "Inverter and MQTT updates pause during setup. If the new network connects, the ESP32 restarts; "
+      "if setup times out or fails, it restores the previous Wi-Fi settings when available and "
+      "resumes operation or retries setup.");
   delay(2000);
   mySmartConfig();
 
@@ -433,8 +821,37 @@ void ESP32_SMA_MQTT::connectAP(){
 
 
 void ESP32_SMA_MQTT::wifiLoop(bool receiveWait){
-  // Attempt to reconnect to Wifi if disconnected
   unsigned long currentMillis = millis();
+  if (wifiStartupRecoveryPending) {
+    if (receiveWait) return;
+    if (static_cast<uint32_t>(currentMillis - wifiRecoveryRetryAt) >= wifiRecoveryRetryDelay) {
+      wifiRecoveryRetryAt = currentMillis;
+      if (recoverInterruptedWiFiProvisioning()) {
+        wifiStartupRecoveryPending = false;
+        if (startStationAfterWiFiRecovery() && !wifiStartupRecoveryPending) {
+          WiFi.setAutoReconnect(true);
+          wifiRecoveryRetryDelay = 5000UL;
+        } else {
+          if (!wifiStartupRecoveryPending) deferStationUntilWiFiRecovery();
+          if (wifiRecoveryRetryDelay < 60000UL) {
+            wifiRecoveryRetryDelay = wifiRecoveryRetryDelay >= 30000UL ? 60000UL : wifiRecoveryRetryDelay * 2;
+          }
+        }
+      } else if (wifiRecoveryRetryDelay < 60000UL) {
+        wifiRecoveryRetryDelay = wifiRecoveryRetryDelay >= 30000UL ? 60000UL : wifiRecoveryRetryDelay * 2;
+      }
+    }
+    if (wifiStartupRecoveryPending) {
+      ESP32_SMA_Inverter_App::webServer.handleClient();
+      return;
+    }
+  }
+
+#ifndef WIFI_SSID
+  serviceEmptyWiFiBootstrapRetry(receiveWait);
+#endif
+
+  // Attempt to reconnect to Wifi if disconnected
   // if WiFi is down, try reconnecting
   if ((WiFi.status() != WL_CONNECTED) && (currentMillis - mqttInstance.previousMillis >= mqttInstance.interval)) {
     logW("Reconnecting to WiFi...\n");
@@ -444,13 +861,21 @@ void ESP32_SMA_MQTT::wifiLoop(bool receiveWait){
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    publishEspStatus();
-    if (ESP32_SMA_Inverter_App::client.connected()) {
-      ESP32_SMA_Inverter_App::client.loop();
+    if (!ntpStarted) wifiTime();
+    // MQTT packet reads can block per byte. Defer all broker work while a
+    // Bluetooth reply is outstanding so it cannot consume the reply deadline.
+    // A long poll may miss MQTT keepalive; the next normal pass can reconnect.
+    if (!receiveWait) {
+      publishEspStatus(true);
+      if (ESP32_SMA_Inverter_App::client.connected()) {
+        ESP32_SMA_Inverter_App::client.loop();
+      }
     }
   }
 
-  ESP32_SMA_Inverter_App::webServer.handleClient();
+  // WebServer dispatch and response writes are synchronous. Keep a slow HTTP
+  // peer from consuming the deadline of an outstanding Bluetooth reply.
+  if (!receiveWait) ESP32_SMA_Inverter_App::webServer.handleClient();
 }
 
 void ESP32_SMA_MQTT::formPage () {
