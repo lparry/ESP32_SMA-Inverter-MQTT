@@ -39,8 +39,44 @@ With Home Assistant discovery enabled, these appear as diagnostic sensors on the
 device, including its ESP32 IP address and a link to the web UI. Sensor states expire after
 180 seconds if the ESP stops publishing. MQTT state messages are not retained. The status
 page is readable without credentials; changing configuration or setting the inverter clock
-still requires the configured MQTT username and password.
+requires the configured MQTT username and password when a username is configured. With a blank
+MQTT username, those pages remain open.
 
+
+### Bluetooth recovery over USB
+
+At 115200 baud, send `unpair` followed by a newline after switching firmware or
+when Bluetooth authentication fails. This removes only the configured inverter's
+saved bond, confirms that it is absent, and retries the connection immediately,
+including at night. The Bluetooth pairing PIN remains `0000`.
+
+Send `poll` followed by a newline to request an inverter read without waiting for
+the normal night interval. Neither command sets the inverter clock.
+
+When Bluetooth reports an authentication failure from the configured inverter
+during an outgoing connection, the firmware performs one automatic
+unpair-and-retry attempt per boot. Authentication events from other Bluetooth
+peers do not affect the inverter's saved bond.
+Ordinary connection/discovery failures do not repeatedly clear the bond.
+
+A settings-filesystem mount failure preserves its contents and runs with the
+compiled defaults. If a new device needs its filesystem initialized, or you
+have deliberately chosen to discard damaged settings, send `format-config`
+followed by a newline over USB. This erases the settings filesystem and saves
+the current configuration. Startup never formats it automatically.
+
+Builds with `WIFI_SSID` configured enable automatic Wi-Fi reconnect at startup
+and wait up to 60 seconds for the access point. A delayed connection no longer
+automatically enters phone provisioning and blocks Bluetooth initialization.
+The application continues if that wait expires. Builds without compiled Wi-Fi
+credentials keep the initial ESP Touch provisioning flow. If setup fails or
+times out and rollback confirms there are still no saved credentials, the device
+retries ESP Touch after one minute, then backs off to a maximum of five minutes.
+Each retry rechecks the station config and storage state, and waits until no
+Bluetooth receive or inverter poll is active.
+
+Hardware evidence is recorded in the [night-time verification](docs/nighttime-verification-2026-09-30.md)
+and [producing-inverter comparison](docs/daytime-comparison-2026-10-01.md).
 
 ### NOTES:
 
@@ -49,4 +85,3 @@ still requires the configured MQTT username and password.
   - refactor code a bit more for more clarity
   - should be possible to merge/fork with the sbfspot project, or at least re-use more code from it without needing to port.
   - should also be possible to directly integrate into Home Assistant through esphome without the going through mqtt. Also this allows OTA update and (re)configuration through yaml files. see my first attempt here: https://github.com/keerekeerweere/esphome_smabluetooth
-
