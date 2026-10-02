@@ -37,6 +37,8 @@ WebServer ESP32_SMA_Inverter_App::webServer(80);
 
 int ESP32_SMA_Inverter_App::smartConfig = 0;
 
+
+
 static String formatLocalEpoch(int32_t epoch) {
   if (epoch <= 0) return String("unknown");
   time_t value = (time_t)epoch;
@@ -47,11 +49,18 @@ static String formatLocalEpoch(int32_t epoch) {
   return String(formatted);
 }
 
+
+
+
+
+
+
 void setup() { 
 
   Logging::setLevel(esp32m::Info);
   Logging::addAppender(&ETSAppender::instance());
 #ifdef SYSLOG_HOST
+  static UDPAppender udpappender(SYSLOG_HOST);
   udpappender.setMode(UDPAppender::Format::Syslog);
   Logging::addAppender(&udpappender);
 #endif
@@ -237,6 +246,10 @@ void ESP32_SMA_Inverter_App::appLoop() {
   delay(100);
 }
 
+
+
+
+
 void ESP32_SMA_Inverter_App::requestClockSync() {
   time_t now = time(nullptr);
   if (now < 1700000000) {
@@ -380,7 +393,7 @@ void ESP32_SMA_Inverter_App::printFile() {
     return;
   }
 
-  log_w("Configuration file present (%u bytes); secrets not printed", file.size());
+  log_w("Configuration file present (%u bytes); secrets not printed", (unsigned int)file.size());
 
   // Close the file
   file.close();

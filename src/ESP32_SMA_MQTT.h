@@ -18,7 +18,7 @@
 #include "SMA_Inverter.h"
 #include "SMA_Utils.h"
 #include "ESP32_SMA_Inverter_App.h"
-#include "config_values.h"
+#include "ConfigDefaults.h"
 #include "ESP32Loggable.h"
 
 

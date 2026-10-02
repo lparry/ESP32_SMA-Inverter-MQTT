@@ -1,6 +1,8 @@
 #pragma once 
 #ifndef ESP32_SMA_UTILS_H
 #define ESP32_SMA_UTILS_H
+#include <Arduino.h>
+#include "ConfigDefaults.h"
 /* MIT License
 
 Copyright (c) 2022 Lupo135
@@ -58,6 +60,8 @@ SOFTWARE.
 #endif
 
 // Prototypes
+extern bool validMqttPrefix(const String& value);
+extern bool parseSmaBluetoothAddress(const String& value, uint8_t address[6]);
 extern void HexDump(uint8_t *buf, int count, int radix, uint8_t c);
 extern uint8_t printUnixTime(char *buf, time_t t);
 extern uint16_t get_u16(uint8_t *buf);

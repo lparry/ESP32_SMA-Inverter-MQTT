@@ -227,7 +227,7 @@ typedef struct __attribute__ ((packed)) PacketHeader {
     uint16_t  command;
 } L1Hdr;
 
-#pragma pop
+#pragma pack(pop)
 
 class ESP32_SMA_Inverter : public ESP32Loggable {
   public: 

@@ -93,7 +93,7 @@ E_RC ESP32_SMA_Inverter::getPacket(uint8_t expAddr[6], int wait4Command) {
     if (rdCnt != sizeof(L1Hdr)) {
       logV("L1<18=%d bytes", rdCnt);
       #if (DEBUG_SMA > 2)
-      HexDump(BTrdBuf, rdCnt, 10, 'R');
+      HexDump(btrdBuf, rdCnt, 10, 'R');
       #endif
       return E_NODATA;
     }
@@ -119,7 +119,7 @@ E_RC ESP32_SMA_Inverter::getPacket(uint8_t expAddr[6], int wait4Command) {
       }
       logV("L2 Rec=%d bytes", rdCnt-18);
       #if (DEBUG_SMA > 2)
-      HexDump(BTrdBuf, rdCnt, 10, 'R');
+      HexDump(btrdBuf, rdCnt, 10, 'R');
       #endif
 
       //Check if data is coming from the right inverter
@@ -163,7 +163,7 @@ E_RC ESP32_SMA_Inverter::getPacket(uint8_t expAddr[6], int wait4Command) {
       }
     } else {  // L1 only
     #if (DEBUG_SMA > 2)
-      HexDump(BTrdBuf, rdCnt, 10, 'R');
+      HexDump(btrdBuf, rdCnt, 10, 'R');
     #endif
       //Check if data is coming from the right inverter
       if (isValidSender(expAddr, pL1Hdr->SourceAddr)) {
@@ -328,7 +328,7 @@ E_RC ESP32_SMA_Inverter::getInverterDataCfl(uint32_t command, uint32_t first, ui
               if (recordsize == 16) {
                 value64 = get_u64(recptr + 8);
                 if (value64 == UINT64_MAX || value64 == 0x8000000000000000ULL) value64 = 0;
-                logV("value64=%d=0x%08x",value64, value64);
+                logV("value64=%llu=0x%016llx", (unsigned long long)value64, (unsigned long long)value64);
        
                   //if (is_NaN(value64) || is_NaN((uint64_t)value64)) value64 = 0;
               } else if ((dataType != 16) && (dataType != 8) && recordsize >= 20) { // ((dataType != DT_STRING) && (dataType != DT_STATUS)) {
@@ -716,7 +716,7 @@ E_RC ESP32_SMA_Inverter::initialiseSMAConnection() {
 
   if (pcktBufPos < 61) return E_INVRESP;
   invData.Serial = get_u32(pcktBuf + 57);
-  logW("Serial Nr: %lu\n", invData.Serial);
+  logW("Serial Nr: %lu\n", (unsigned long)invData.Serial);
   return E_OK;
 }
 
@@ -888,7 +888,7 @@ E_RC ESP32_SMA_Inverter::logonSMAInverter(const char *password, const uint8_t us
     } else { 
       logW("Unexpected response  %02X:%02X:%02X:%02X:%02X:%02X pcktID=0x%04X rcvpcktID=0x%04X now=0x%04X", 
                    btrdBuf[9], btrdBuf[8], btrdBuf[7], btrdBuf[6], btrdBuf[5], btrdBuf[4],
-                   pcktID, rcvpcktID, now);
+                   pcktID, rcvpcktID, (unsigned int)now);
       rc = E_INVRESP;
     }
     return rc;

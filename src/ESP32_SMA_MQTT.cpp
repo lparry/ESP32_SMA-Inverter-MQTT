@@ -82,7 +82,7 @@ void ESP32_SMA_MQTT::wifiTime() {
 
   long  gmtOffset_sec = config.timezone * 3600;   // offset seconds, this depends on your time zone (3600 is GMT +1)
   int   daylightOffset_sec = 0;  // daylight saving offset seconds
-  logD("Setting time via %s, gmt: %d, dst: %d ", config.ntphostname.c_str(), gmtOffset_sec, daylightOffset_sec);
+  logD("Setting time via %s, gmt: %ld, dst: %d ", config.ntphostname.c_str(), gmtOffset_sec, daylightOffset_sec);
 
 
   configTime(gmtOffset_sec, daylightOffset_sec, config.ntphostname.c_str());
@@ -113,7 +113,7 @@ void ESP32_SMA_MQTT::wifiStartup(){
   // Build Hostname
   logD("wifiStartup()");
   char sapString[20]="";
-  snprintf(sapString, 20, "SMA-%08X", ESP.getEfuseMac());
+  snprintf(sapString, 20, "SMA-%08lX", (unsigned long)(uint32_t)ESP.getEfuseMac());
   mqttInstance.sapString = String(sapString);
   char token[17];
   snprintf(token, sizeof(token), "%08lX%08lX", (unsigned long)esp_random(), (unsigned long)esp_random());
@@ -173,7 +173,7 @@ void ESP32_SMA_MQTT::wifiStartup(){
   // Success connecting
   ESP32_SMA_Inverter_App::smartConfig = 0;
   String hostName = mqttInstance.sapString;
-  logW("hostname %s", hostName);
+  logW("hostname %s", hostName.c_str());
   logW("IP Address: %s", ((String)WiFi.localIP().toString()).c_str());
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);

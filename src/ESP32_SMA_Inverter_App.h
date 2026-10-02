@@ -12,7 +12,7 @@
 
 #include "ESP32_SMA_MQTT.h"
 #include "ESP32_SMA_Inverter_App.h"
-#include "config_values.h"
+#include "ConfigDefaults.h"
 
 
 #include <logging.hpp>
@@ -23,7 +23,7 @@
 #include "SMA_Inverter.h"
 #include "ESP32Loggable.h"
 
-//#include "config_values.h"
+//#include "ConfigDefaults.h"
 
 
 // Uncomment to logoff the inverter after each connection
@@ -36,7 +36,9 @@
 // 1=values only; 
 // 2=values and info and P-buffer
 // 3=values and info and T+R+P-buffer
+#ifndef DEBUG_SMA
 #define DEBUG_SMA 1
+#endif
 
 
 

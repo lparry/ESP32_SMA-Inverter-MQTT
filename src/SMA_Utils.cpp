@@ -114,3 +114,36 @@ uint64_t get_u64(uint8_t *buf) {
     lnglng += *(buf);
     return lnglng;
 }
+
+bool parseSmaBluetoothAddress(const String& value, uint8_t address[6]) {
+  if (!address || value.length() != 17) return false;
+  uint8_t parsed[6];
+  for (size_t octet = 0; octet < 6; ++octet) {
+    const size_t offset = octet * 3;
+    const char high = value[offset];
+    const char low = value[offset + 1];
+    auto hexValue = [](char c) -> int {
+      if (c >= '0' && c <= '9') return c - '0';
+      if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+      if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+      return -1;
+    };
+    const int highNibble = hexValue(high);
+    const int lowNibble = hexValue(low);
+    if (highNibble < 0 || lowNibble < 0 || (octet < 5 && value[offset + 2] != ':')) return false;
+    parsed[octet] = static_cast<uint8_t>((highNibble << 4) | lowNibble);
+  }
+  for (size_t octet = 0; octet < 6; ++octet) address[octet] = parsed[octet];
+  return true;
+}
+
+// A discovery object ID is also used as one MQTT topic segment.
+bool validMqttPrefix(const String& value) {
+  if (value.isEmpty() || value.length() > 32) return false;
+  for (size_t k = 0; k < value.length(); ++k) {
+    const char c = value[k];
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
+  }
+  return true;
+}
