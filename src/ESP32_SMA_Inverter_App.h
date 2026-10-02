@@ -5,7 +5,7 @@
 #include <Arduino.h>
 #include <Esp.h>
 #include <WiFiClient.h>
-#include <WebServer.h>
+#include "BoundedWebServer.h"
 #include <PubSubClient.h>
 
 #include <BluetoothSerial.h>
@@ -83,20 +83,26 @@ class ESP32_SMA_Inverter_App : public ESP32Loggable {
 
     static int smartConfig;
 
-    static WebServer webServer;
+    static BoundedWebServer webServer;
     static WiFiClient espClient;
     static PubSubClient client;
 
     AppConfig appConfig;
 
     //Prototypes
-     void loadConfiguration();
-     void saveConfiguration();
+     bool loadConfiguration();
+     bool saveConfiguration();
      void printFile();
      void configSetup();
      void rmfiles();
      void requestClockSync();
+     void requestDiscovery() { firstTime = true; nextDiscoveryAttempt = millis(); }
      String getClockSyncStatus() const { return clockSyncStatus; }
+     bool isPolling() const { return pollingInProgress; }
+     bool configurationStorageReady() const { return configurationStorageAvailable; }
+     const DisplayData& lastDisplayData() const {
+       return hasSuccessfulRead ? pendingDisplay : ESP32_SMA_Inverter::dispData;
+     }
 
     protected:
       //extern BluetoothSerial serialBT;
@@ -121,14 +127,38 @@ class ESP32_SMA_Inverter_App : public ESP32Loggable {
 
         char smaInvPass[13];  // 12 protocol characters plus C-string terminator
         uint8_t smaBTAddress[6]; // SMA bluetooth address
+        bool bluetoothAddressValid = false;
         //uint8_t  espBTAddress[6]; // is retrieved from BT packet
 
         uint32_t nextTime = 0;
+        bool bluetoothReady = false;
+        bool bluetoothInitRetryScheduled = false;
+        uint32_t nextBluetoothInitAttempt = 0;
+        uint32_t bluetoothInitRetryMs = 1000;
+        int lastAdjustedScanRate = 0;
+        uint32_t lastSuccessfulReadMillis = 0;
+        bool hasSuccessfulRead = false;
         int failCount = 0;
         bool clockSyncRequested = false;
         uint32_t clockSyncRequestDeadline = 0;
         String clockSyncStatus = "Never requested";
+        char serialCommand[16] = {};
+        uint8_t serialCommandLength = 0;
+        bool serialCommandOverflow = false;
+        void handleSerialCommands();
+        void initializeBluetoothIfDue();
+        bool pollingInProgress = false;
+        bool readingPending = false;
+        InverterData pendingReading = {};
+        DisplayData pendingDisplay = {};
+        uint32_t pendingReadingAcquiredMillis = 0;
+        uint32_t pendingReadingMaxAgeMillis = 0;
+        uint32_t nextPublishAttempt = 0;
+        bool serialSavePending = false;
+        uint32_t nextSerialSaveAttempt = 0;
+        bool configurationStorageAvailable = true;
 
+        const char *pendingRecoveryFile = nullptr;
         const String confFile = "/config.txt"; //extern const char *confFile = "/config.txt";  
 
 };

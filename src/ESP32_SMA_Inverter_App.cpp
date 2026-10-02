@@ -24,6 +24,11 @@ SOFTWARE.
 
 
 #include "ESP32_SMA_Inverter_App.h"
+#include <cstdio>
+#include <cmath>
+#if defined(ARDUINO_ARCH_ESP32)
+#include <unistd.h>
+#endif
 
 
 
@@ -33,11 +38,37 @@ ESP32_SMA_MQTT& mqttInstanceForApp = ESP32_SMA_MQTT::getInstance();
 
 WiFiClient ESP32_SMA_Inverter_App::espClient = WiFiClient();
 PubSubClient ESP32_SMA_Inverter_App::client = PubSubClient(espClient);
-WebServer ESP32_SMA_Inverter_App::webServer(80);
+BoundedWebServer ESP32_SMA_Inverter_App::webServer(80);
 
 int ESP32_SMA_Inverter_App::smartConfig = 0;
 
-
+static bool writeTemporaryConfiguration(const String& payload) {
+#if defined(ARDUINO_ARCH_ESP32)
+  // Arduino File::flush/close hide fflush, fsync and fclose failures. Use the
+  // registered LittleFS VFS directly so a failed sync cannot commit settings.
+  FILE *file = fopen("/littlefs/config.tmp", "wb");
+  if (!file) return false;
+  bool complete = fwrite(payload.c_str(), 1, payload.length(), file) == payload.length();
+  if (fflush(file) != 0) complete = false;
+  if (fsync(fileno(file)) != 0) complete = false;
+  if (fclose(file) != 0) complete = false;
+#else
+  // Host hardware fakes use the File interface. Readback is shared below.
+  File file = LittleFS.open("/config.tmp", "w");
+  if (!file) return false;
+  bool complete = file.write(reinterpret_cast<const uint8_t*>(payload.c_str()), payload.length()) == payload.length();
+  file.flush();
+  file.close();
+#endif
+  if (!complete) return false;
+  File verified = LittleFS.open("/config.tmp", "r");
+  bool matches = verified && verified.size() == payload.length();
+  for (size_t i = 0; matches && i < payload.length(); ++i) {
+    matches = verified.read() == static_cast<uint8_t>(payload[i]);
+  }
+  verified.close();
+  return matches;
+}
 
 static String formatLocalEpoch(int32_t epoch) {
   if (epoch <= 0) return String("unknown");
@@ -51,9 +82,24 @@ static String formatLocalEpoch(int32_t epoch) {
 
 
 
+static float configuredTimezoneFallback() {
+  const float configured = static_cast<float>(TIMEZONE);
+  return std::isfinite(configured) && configured >= -12.0f && configured <= 14.0f
+      ? configured
+      : 0.0f;
+}
 
+static float loadTimezone(JsonVariantConst value) {
+  const float fallback = configuredTimezoneFallback();
+  // The file format historically stores whole-hour offsets as JSON integers,
+  // while the settings page also accepts fractional-hour offsets.
+  if (!value.is<int>() && !value.is<uint32_t>() && !value.is<float>()) return fallback;
 
-
+  const float configured = value.as<float>();
+  return std::isfinite(configured) && configured >= -12.0f && configured <= 14.0f
+      ? configured
+      : fallback;
+}
 
 void setup() { 
 
@@ -265,19 +311,28 @@ void ESP32_SMA_Inverter_App::requestClockSync() {
 
 
 // Loads the configuration from a file
-void ESP32_SMA_Inverter_App::loadConfiguration() {
-  // Open file for reading
-  File file = LittleFS.open("/config.txt","r");
-
-  // Allocate a temporary JsonDocument
-  // Don't forget to change the capacity to match your requirements.
-  // Use arduinojson.org/v6/assistant to compute the capacity.
-  StaticJsonDocument<1024> doc;
-
-  // Deserialize the JSON document
-  DeserializationError error = deserializeJson(doc, file);
-  if (error)
-    log_e("Failed to read file, using default configuration");
+bool ESP32_SMA_Inverter_App::loadConfiguration() {
+  pendingRecoveryFile = nullptr;
+  StaticJsonDocument<2048> doc;
+  bool recovered = true;
+  // The backup is the last committed configuration; a temporary file is last resort.
+  for (const char *path : {"/config.txt", "/config.bak", "/config.tmp"}) {
+    File file = LittleFS.open(path, "r");
+    doc.clear();
+    bool valid = file && !deserializeJson(doc, file) && doc.is<JsonObject>() &&
+        doc["mqttTopic"].is<const char *>() && doc["smaBTAddress"].is<const char *>();
+    file.close();
+    if (!valid) { doc.clear(); continue; }
+    if (strcmp(path, "/config.txt") != 0) {
+      LittleFS.remove("/config.txt");
+      recovered = LittleFS.rename(path, "/config.txt");
+      if (!recovered) {
+        pendingRecoveryFile = path;
+        log_e("Could not restore configuration; keeping recovery file");
+      }
+    }
+    break;
+  }
 
   // Copy values from the JsonDocument to the Config         
   std::vector<std::string> keyNames = {"mqttBroker", "mqttPort", "mqttUser","mqttPasswd", "mqttTopic","smaInvPass", "smaBTAddress", "scanRate", "hassDisc","thisserial"};
@@ -286,57 +341,49 @@ void ESP32_SMA_Inverter_App::loadConfiguration() {
     log_w("loaded key: %s", k.c_str());
   }
 
-  #ifdef SMA_WIFI_CONFIG_VALUES_H
     appConfig.mqttBroker =  doc["mqttBroker"] | MQTT_BROKER;
     appConfig.mqttPort = doc["mqttPort"] | MQTT_PORT ;
     appConfig.mqttUser = doc["mqttUser"] | MQTT_USER;
     appConfig.mqttPasswd = doc["mqttPasswd"] | MQTT_PASS;
     appConfig.mqttTopic = doc["mqttTopic"] | MQTT_topic;
+    if (!validMqttPrefix(appConfig.mqttTopic)) appConfig.mqttTopic = "SMA";
     appConfig.smaInvPass = doc["smaInvPass"] | SMA_PASS;
     appConfig.smaBTAddress = doc["smaBTAddress"] | SMA_BTADDRESS;
     appConfig.scanRate = doc["scanRate"] | SCAN_RATE ;
     appConfig.hassDisc = doc["hassDisc"] | HASS_DISCOVERY ;
-    appConfig.timezone = doc["timezone"] | TIMEZONE;
+    appConfig.timezone = loadTimezone(doc["timezone"]);
     appConfig.ntphostname = doc["ntphostname"] | NTPHOSTNAME;
-    appConfig.thisSerial = doc["thisserial"] | THISSERIAL;
-  #else
-    appConfig.mqttBroker =  doc["mqttBroker"] | "";
-    appConfig.mqttPort = doc["mqttPort"] | 1883 ;
-    appConfig.mqttUser = doc["mqttUser"] | "";
-    appConfig.mqttPasswd = doc["mqttPasswd"] | "";
-    appConfig.mqttTopic = doc["mqttTopic"] | "SMA";
-    appConfig.smaInvPass = doc["smaInvPass"] | "password";
-    appConfig.smaBTAddress = doc["smaBTAddress"] | "AA:BB:CC:DD:EE:FF";
-    appConfig.scanRate = doc["scanRate"] | 60 ;
-    appConfig.hassDisc = doc["hassDisc"] | true ;
-    appConfig.timezone = doc["timezone"] | 1;
-    appConfig.ntphostname = doc["ntphostname"] | "pool.ntp.org";
-    appConfig.thisSerial = doc["thisserial"] | 0;
-  #endif
+    const auto storedSerial = doc["thisserial"];
+    const uint32_t defaultSerial = static_cast<uint32_t>(THISSERIAL);
+    appConfig.thisSerial = storedSerial.is<uint32_t>()
+        ? storedSerial.as<uint32_t>() : defaultSerial;
+
 
   
   // Close the file (Curiously, File's destructor doesn't close the file)
-  file.close();
-  
+  return recovered;
 }
 
 
 
 // Saves the configuration to a file
-void ESP32_SMA_Inverter_App::saveConfiguration() {
+bool ESP32_SMA_Inverter_App::saveConfiguration() {
+  if (!configurationStorageAvailable) return false;
+  if (pendingRecoveryFile != nullptr) {
+    if (!LittleFS.rename(pendingRecoveryFile, "/config.txt")) return false;
+    pendingRecoveryFile = nullptr;
+  }
+  // Do not delete the only committed file after an interrupted replacement.
+  if (!LittleFS.exists("/config.txt") && LittleFS.exists("/config.bak") &&
+      !LittleFS.rename("/config.bak", "/config.txt")) return false;
   const char *tempConfig = "/config.tmp";
   LittleFS.remove(tempConfig);
   log_i("creating temporary configuration file");
-  File file = LittleFS.open(tempConfig, "w");
-  if (!file) {
-    log_e("Failed to create file");
-    return;
-  }
 
   // Allocate a temporary JsonDocument
   // Don't forget to change the capacity to match your requirements.
   // Use arduinojson.org/assistant to compute the capacity.
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<2048> doc;
 
   // Set the values in the document
   doc["mqttBroker"] = appConfig.mqttBroker;
@@ -358,30 +405,35 @@ void ESP32_SMA_Inverter_App::saveConfiguration() {
     log_w("saving key: %s", k.c_str());
   }
  
-  // Serialize JSON to file
-  if (serializeJson(doc, file) == 0) {
-    log_e("Failed to write to file");
-  } else {
-    log_w("wrote to file");
+  // Reject allocation failures and partial writes before touching the good file.
+  if (doc.overflowed()) {
+    LittleFS.remove(tempConfig);
+    return false;
   }
-
-  // Close the file
-  file.close();
+  const size_t expected = measureJson(doc);
+  String payload;
+  if (!payload.reserve(expected) || serializeJson(doc, payload) != expected ||
+      !writeTemporaryConfiguration(payload)) {
+    log_e("Configuration write or sync failed");
+    LittleFS.remove(tempConfig);
+    return false;
+  }
   const char *backupConfig = "/config.bak";
-  LittleFS.remove(backupConfig);
+  if (LittleFS.exists(backupConfig) && !LittleFS.remove(backupConfig)) return false;
   bool hadConfig = LittleFS.exists("/config.txt");
   if (hadConfig && !LittleFS.rename("/config.txt", backupConfig)) {
     log_e("Failed to preserve existing configuration");
     LittleFS.remove(tempConfig);
-    return;
+    return false;
   }
   if (!LittleFS.rename(tempConfig, "/config.txt")) {
     log_e("Failed to install configuration file");
     if (hadConfig) LittleFS.rename(backupConfig, "/config.txt");
-    return;
+    return false;
   }
-  LittleFS.remove(backupConfig);
+  // Keep the last committed configuration available for startup recovery.
   log_d("close file");
+  return true;
 }
 
 // Prints the content of a file to the Serial
@@ -401,20 +453,16 @@ void ESP32_SMA_Inverter_App::printFile() {
 
 void ESP32_SMA_Inverter_App::configSetup() {
   
-  if (!LittleFS.begin(false)) {
-    log_e("LittleFS mount failed");
-    if (!LittleFS.begin(true /* true: format */)) {
-      Serial.println("Failed to format LittleFS");
-    } else {
-      Serial.println("LittleFS formatted successfully");
-    }
+  configurationStorageAvailable = LittleFS.begin(false);
+  if (!configurationStorageAvailable) {
+    log_e("LittleFS mount failed; preserving flash and using compiled defaults");
   } else{
     log_w("little fs mount sucess");
   }
 
   // Should load default config if run for the first time
   log_w("Loading configuration...");
-  loadConfiguration( );
+  if (!loadConfiguration() || !configurationStorageAvailable) return;
 
   // Create configuration file
   log_w("Saving configuration...");

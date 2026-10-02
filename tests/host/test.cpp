@@ -51,12 +51,138 @@ E_RC query(const std::vector<uint8_t>&data,uint32_t first=1,uint32_t last=1,uint
  b.sent=[&]{queueResponse(b,response(i,data,first,last,status));b.output.clear();};
  auto rc=i.getInverterDataCfl(0x51000200,first,last);b.sent=nullptr;return rc;
 }
+void testSaveFailures(){
+ auto&a=ESP32_SMA_Inverter_App::getInstance();
+ a.loadConfiguration();
+ assert(a.saveConfiguration());
+ const auto good=fake::files["/config.txt"];
+ a.appConfig.mqttBroker="changed";
+ for(size_t limit:{size_t(0),size_t(40)}){
+  fake::writeLimit=limit;assert(!a.saveConfiguration());assert(fake::files["/config.txt"]==good);
+ }
+ fake::writeLimit=SIZE_MAX;
+ a.appConfig.mqttBroker=std::string(3000,'x');
+ assert(!a.saveConfiguration());assert(fake::files["/config.txt"]==good);
+ a.appConfig.mqttBroker="broker";
+ assert(a.saveConfiguration());
+}
+void testConfigRecovery(){
+ auto&a=ESP32_SMA_Inverter_App::getInstance();
+ a.loadConfiguration();a.saveConfiguration();auto good=fake::files["/config.txt"];
+ for(bool corrupt:{false,true}){
+  fake::files.clear();fake::files["/config.bak"]=good;
+  fake::files["/config.tmp"]="{partial";
+  if(corrupt)fake::files["/config.txt"]="{";
+  assert(a.loadConfiguration());assert(fake::files["/config.txt"]==good);
+  assert(a.saveConfiguration());
+ }
+ fake::files.clear();fake::files["/config.tmp"]=good;assert(a.loadConfiguration());
+ assert(fake::files["/config.txt"]==good);
+ fake::files.clear();fake::files["/config.bak"]=good;fake::failRenameFrom="/config.bak";
+ assert(!a.loadConfiguration());assert(!a.saveConfiguration());
+ assert(fake::files["/config.bak"]==good);fake::failRenameFrom="";
+ assert(a.loadConfiguration());
+ fake::files.clear();fake::files["/config.tmp"]=good;fake::files["/config.bak"]="{bad";
+ fake::failRenameFrom="/config.tmp";assert(!a.loadConfiguration());fake::writeLimit=0;
+ assert(!a.saveConfiguration());assert(fake::files["/config.tmp"]==good);
+ fake::failRenameFrom="";fake::writeLimit=SIZE_MAX;assert(a.loadConfiguration());
+}
+void testSerialConfigPersistenceAndValidation(){
+ auto&a=ESP32_SMA_Inverter_App::getInstance();auto&m=ESP32_SMA_MQTT::getInstance();
+ auto&i=ESP32_SMA_Inverter::getInstance();
+ const AppConfig originalConfig=a.appConfig;const uint32_t originalInverterSerial=i.invData.Serial;
+ const uint32_t defaultSerial=static_cast<uint32_t>(THISSERIAL);
+ const auto originalFiles=fake::files;const auto originalNvs=fake::nvs;
+ const size_t originalWriteLimit=fake::writeLimit;const int originalNvsWrites=fake::nvsWrites;
+ const bool originalMountable=fake::mountable;
+ const bool originalNvsOpenFail=fake::nvsOpenFail,originalNvsReadFail=fake::nvsReadFail;
+ const bool originalNvsFail=fake::nvsFail,originalNvsBlobReadFail=fake::nvsBlobDataReadFail;
+ const bool originalNvsIdentityTypeMismatch=fake::nvsIdentityTypeMismatch;
+ const std::string originalNvsFailReadKey=fake::nvsFailReadKey;
+ const std::string originalNvsFailWriteKey=fake::nvsFailWriteKey;
+ const std::string originalNvsFailEraseKey=fake::nvsFailEraseKey;
+ const String originalDiscoveryIdentity=m.discoveryIdentity;
+ const bool originalDiscoveryLoaded=m.discoveryIdentityLoaded;
+ const uint32_t originalDiscoveryAttempt=m.lastDiscoveryMigrationAttemptMillis;
+ const bool originalDiscoveryAttempted=m.discoveryMigrationAttempted;
+ const bool originalStorageAvailable=a.configurationStorageAvailable;
+ fake::mountable=true;a.configurationStorageAvailable=true;
+ a.appConfig.mqttTopic="SMA";a.appConfig.smaBTAddress="00:80:25:00:00:00";
+ for(uint32_t serial:{0x80000000u,3000000000u,UINT32_MAX}){
+  fake::files.clear();a.appConfig.thisSerial=serial;
+  assert(a.saveConfiguration());
+  a.appConfig.thisSerial=17;
+  assert(a.loadConfiguration());assert(a.appConfig.thisSerial==serial);
+  a.appConfig.thisSerial=17;
+  a.configSetup();
+  assert(a.configurationStorageReady());assert(a.appConfig.thisSerial==serial);
+  StaticJsonDocument<2048> saved;assert(!deserializeJson(saved,fake::files["/config.txt"]));
+  assert(saved["thisserial"].is<uint32_t>()&&saved["thisserial"].as<uint32_t>()==serial);
+ }
 
+ // A restored serial must be available for Home Assistant identity migration
+ // before Bluetooth has supplied a live inverter serial.
+ a.appConfig.thisSerial=3000000000u;i.invData.Serial=0;
+ fake::nvs.clear();fake::nvsOpenFail=fake::nvsReadFail=fake::nvsFail=false;
+ fake::nvsBlobDataReadFail=fake::nvsIdentityTypeMismatch=false;
+ fake::nvsFailReadKey=fake::nvsFailWriteKey=fake::nvsFailEraseKey="";
+ m.discoveryIdentity="";m.discoveryIdentityLoaded=false;
+ m.discoveryMigrationAttempted=false;
+ assert(m.prepareDiscovery(a.appConfig));
+ assert(m.discoveryIdentity=="SMA-3000000000");
 
+ auto loadSerialJson=[&](const char *serialJson,uint32_t expected){
+  fake::files.clear();
+  fake::files["/config.txt"] = std::string("{\"mqttTopic\":\"SMA\",\"smaBTAddress\":\"00:80:25:00:00:00\"")+
+      (serialJson ? std::string(",\"thisserial\":")+serialJson : std::string())+"}";
+  a.appConfig.thisSerial=999;
+  assert(a.loadConfiguration());assert(a.appConfig.thisSerial==expected);
+ };
+ loadSerialJson("42",42); // legacy integer format remains accepted
+ loadSerialJson(nullptr,defaultSerial); // older files use the compiled fallback
+ for(const char *invalid:{"-1","4294967296","123.0","3000000000.0","1e40"})
+  loadSerialJson(invalid,defaultSerial);
 
+ fake::files=originalFiles;fake::writeLimit=originalWriteLimit;
+ fake::mountable=originalMountable;fake::nvs=originalNvs;fake::nvsWrites=originalNvsWrites;
+ fake::nvsOpenFail=originalNvsOpenFail;fake::nvsReadFail=originalNvsReadFail;
+ fake::nvsFail=originalNvsFail;fake::nvsBlobDataReadFail=originalNvsBlobReadFail;
+ fake::nvsIdentityTypeMismatch=originalNvsIdentityTypeMismatch;
+ fake::nvsFailReadKey=originalNvsFailReadKey;fake::nvsFailWriteKey=originalNvsFailWriteKey;
+ fake::nvsFailEraseKey=originalNvsFailEraseKey;m.discoveryIdentity=originalDiscoveryIdentity;
+ m.discoveryIdentityLoaded=originalDiscoveryLoaded;
+ m.lastDiscoveryMigrationAttemptMillis=originalDiscoveryAttempt;
+ m.discoveryMigrationAttempted=originalDiscoveryAttempted;
+ a.appConfig=originalConfig;i.invData.Serial=originalInverterSerial;
+ a.configurationStorageAvailable=originalStorageAvailable;
+}
+void testSettingsToken(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&w=a.webServer;
+ m.settingsToken="secret";a.appConfig.mqttBroker="unchanged";
+ for(const char*t:{"", "wrong"}){
+  w.params={{"mqttBroker","attacker"},{"token",t}};m.handleForm();
+  assert(w.code==403);assert(a.appConfig.mqttBroker=="unchanged");
+ }
+ w.params={{"token","secret"},{"mqttBroker","allowed"}};fake::writeLimit=0;
+ m.handleForm();assert(w.code==500);fake::writeLimit=SIZE_MAX;
+ m.formPage();assert(w.body.s.find("name=\"token\" value=\"secret\"")!=std::string::npos);
+}
 
-
-
+static std::string base64ForHttpTest(const std::string&input){
+ static const char alphabet[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+ std::string encoded;
+ for(size_t offset=0;offset<input.size();offset+=3){
+  const size_t remaining=input.size()-offset;
+  const uint8_t a=static_cast<uint8_t>(input[offset]);
+  const uint8_t b=remaining>1?static_cast<uint8_t>(input[offset+1]):0;
+  const uint8_t c=remaining>2?static_cast<uint8_t>(input[offset+2]):0;
+  const uint32_t block=(static_cast<uint32_t>(a)<<16)|(static_cast<uint32_t>(b)<<8)|c;
+  encoded+=alphabet[(block>>18)&0x3f];encoded+=alphabet[(block>>12)&0x3f];
+  encoded+=remaining>1?alphabet[(block>>6)&0x3f]:'=';
+  encoded+=remaining>2?alphabet[block&0x3f]:'=';
+ }
+ return encoded;
+}
 
 struct AppHttpResponse {
  int code=0;
@@ -65,22 +191,222 @@ struct AppHttpResponse {
  bool restarted=false;
 };
 
+static AppHttpResponse appHttpRequest(const std::string&method,const std::string&path,
+                                      const std::string&body,const std::string*authorization){
+ auto&server=ESP32_SMA_Inverter_App::webServer;
+ server.code=0;server.body="";server.responseHeaders.clear();
+ std::string request=method+" "+path+" HTTP/1.1\r\nHost: test\r\n";
+ if(authorization)request+="Authorization: "+*authorization+"\r\n";
+ if(method=="POST"){
+  request+="Content-Type: application/x-www-form-urlencoded\r\nContent-Length: "+
+      std::to_string(body.size())+"\r\n\r\n"+body;
+ }else request+="\r\n";
+ WiFiClient client(request);server._server.pending.push_back(client);
+ bool restarted=false;
+ try{
+  for(unsigned calls=0;client.socket->open&&calls<64;++calls)server.handleClient();
+ }catch(const fake::Restart&){restarted=true;server.close();}
+ if(client.socket->open)server.close();
+ return {server.code,server.body.s,server.responseHeaders,restarted};
+}
+
+static void assertBasicChallenge(const AppHttpResponse&response){
+ assert(response.code==401);
+ auto challenge=response.headers.find("WWW-Authenticate");
+ assert(challenge!=response.headers.end());
+ assert(challenge->second=="Basic realm=\"Login Required\"");
+}
 
 
 
+void testNumericSettingsValidation(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&w=a.webServer;
+ const AppConfig original=a.appConfig;const auto originalTicks=fake::ticks;
+ m.settingsToken="secret";
+ a.appConfig.mqttBroker="before";a.appConfig.mqttPort=1883;a.appConfig.scanRate=60;
+ a.appConfig.timezone=0.5f;a.appConfig.hassDisc=true;
+ assert(a.saveConfiguration());
+ const auto committed=fake::files["/config.txt"];
+ auto rejected=[&](const char*name,const std::string&value){
+  w.params={{"token","secret"},{"mqttBroker","must-not-save"},{name,value}};w.code=0;
+  m.handleForm();
+  assert(w.code==400);assert(a.appConfig.mqttBroker=="before");
+  assert(a.appConfig.mqttPort==1883&&a.appConfig.scanRate==60&&a.appConfig.timezone==0.5f);
+  assert(a.appConfig.hassDisc);assert(fake::files["/config.txt"]==committed);
+ };
+ for(const std::string&value:std::vector<std::string>{"","1883junk","0","65536",std::string(80,'9')}) rejected("mqttPort",value);
+ for(const std::string&value:std::vector<std::string>{"","60junk","60.5","2147483648",std::string(80,'9')}) rejected("scanRate",value);
+ for(const std::string&value:std::vector<std::string>{"","NaN","Infinity","-inf","5hours","1e9999","1e-9999"}) rejected("timezone",value);
+ auto saved=[&](const char*port,const char*scanRate,const char*timezone){
+  w.params={{"token","secret"},{"mqttPort",port},{"scanRate",scanRate},{"timezone",timezone}};w.code=0;
+  try{m.handleForm();assert(false);}catch(const fake::Restart&){}
+  assert(w.code==200);
+ };
+ saved("1","-1","-20");
+ assert(a.appConfig.mqttPort==1&&a.appConfig.scanRate==10&&a.appConfig.timezone==-12.0f);
+ saved("65535","3601","20.25");
+ assert(a.appConfig.mqttPort==65535&&a.appConfig.scanRate==3600&&a.appConfig.timezone==14.0f);
+ saved("1883","900","-4.5");
+ assert(a.appConfig.mqttPort==1883&&a.appConfig.scanRate==900&&a.appConfig.timezone==-4.5f);
+ StaticJsonDocument<2048> json;assert(!deserializeJson(json,fake::files["/config.txt"]));
+ assert(json["mqttPort"]==1883&&json["scanRate"]==900&&json["timezone"]==-4.5f);
+ a.appConfig=original;assert(a.saveConfiguration());fake::ticks=originalTicks;
+}
 
+void testTimezoneConfigurationReload(){
+ auto&a=ESP32_SMA_Inverter_App::getInstance();
+ const AppConfig original=a.appConfig;const auto originalFiles=fake::files;
+ const bool originalStorageReady=a.configurationStorageAvailable;
+ assert(a.saveConfiguration());
 
+ // Save/load and the normal startup load-and-save path must preserve the
+ // fractional offsets accepted by the settings page.
+ for(float timezone:{5.5f,9.5f,-3.5f,5.75f}){
+  a.appConfig.timezone=timezone;assert(a.saveConfiguration());
+  a.appConfig.timezone=0;
+  assert(a.loadConfiguration());assert(a.appConfig.timezone==timezone);
+  a.appConfig.timezone=0;a.configSetup();
+  assert(a.appConfig.timezone==timezone);
+ }
 
+ const float compiledTimezone=static_cast<float>(TIMEZONE);
+ const float safeFallback=std::isfinite(compiledTimezone) &&
+         compiledTimezone>=-12.0f && compiledTimezone<=14.0f
+     ? compiledTimezone : 0.0f;
+ StaticJsonDocument<2048> base;
+ assert(!deserializeJson(base,fake::files["/config.txt"]));
+ base["timezone"]=10;
+ String legacyPayload;serializeJson(base,legacyPayload);
+ fake::files["/config.txt"]=legacyPayload.s;
+ a.appConfig.timezone=0;
+ assert(a.loadConfiguration());assert(a.appConfig.timezone==10.0f);
 
+ // Bad optional timezone values must fall back safely without rejecting an
+ // otherwise valid legacy file or disturbing its recovery backup.
+ const std::string validConfig=fake::files["/config.txt"];
+ const std::string backup="preserved recovery backup";
+ fake::files["/config.bak"]=backup;
+ auto checkFallback=[&](const char*kind){
+  StaticJsonDocument<2048> doc;
+  assert(!deserializeJson(doc,validConfig));
+  if(std::strcmp(kind,"missing")==0) doc.remove("timezone");
+  else if(std::strcmp(kind,"string")==0) doc["timezone"]="5.5";
+  else if(std::strcmp(kind,"boolean")==0) doc["timezone"]=true;
+  else if(std::strcmp(kind,"null")==0) doc["timezone"]=nullptr;
+  else if(std::strcmp(kind,"too-low")==0) doc["timezone"]=-12.25;
+  else if(std::strcmp(kind,"too-high")==0) doc["timezone"]=14.25;
+  else if(std::strcmp(kind,"large-finite")==0) doc["timezone"]=1e39;
+  String payload;serializeJson(doc,payload);fake::files["/config.txt"]=payload.s;
+  a.appConfig.timezone=123.0f;
+  assert(a.loadConfiguration());
+  assert(std::isfinite(a.appConfig.timezone));
+  assert(a.appConfig.timezone>=-12.0f&&a.appConfig.timezone<=14.0f);
+  assert(a.appConfig.timezone==safeFallback);
+  assert(fake::files["/config.bak"]==backup);
+ };
+ for(const char*kind:{"missing","string","boolean","null","too-low","too-high","large-finite"})
+  checkFallback(kind);
 
+ fake::files=originalFiles;a.appConfig=original;
+ a.configurationStorageAvailable=originalStorageReady;
+}
 
+void testNtpInput(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&w=a.webServer;
+ a.appConfig.ntphostname="\"><script>alert(1)</script>";m.formPage();
+ assert(w.body.s.find("<script>")==std::string::npos);
+ assert(w.body.s.find("&quot;&gt;&lt;script&gt;")!=std::string::npos);
+ a.appConfig.ntphostname="pool.ntp.org";
+ for(const String&host:{String("\" onfocus=alert(1)"),String(std::string(64,'a')+".org"),String("-bad.org")}){
+  w.params={{"token","secret"},{"ntphostname",host}};m.handleForm();
+  assert(w.code==400);assert(a.appConfig.ntphostname=="pool.ntp.org");
+ }
+}
+void testExcessFormArguments(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&w=a.webServer;
+ m.settingsToken="secret";a.appConfig.mqttBroker="before";
+ w.params={{"token","secret"},{"mqttBroker","after"}};
+ for(int i=0;i<300;i++)w.params.push_back({"unused","x"});
+ m.handleForm();assert(w.code==413);assert(a.appConfig.mqttBroker=="before");
+ w.params={{"token","secret"},{"mqttBroker","after"},{"ntphostname","invalid<"}};
+ m.handleForm();assert(w.code==400);assert(a.appConfig.mqttBroker=="before");
+}
+void drainHttp(BoundedWebServer &server,const WiFiClient &client){
+ for(int n=0;n<100&&client.socket->open;++n)server.handleClient();
+}
+void testBoundedHttpRequests(){
+ BoundedWebServer server;server.begin();int dispatched=0;
+ server.on("/",[&]{++dispatched;server.send(200,"text/plain","ok");});
+ server.on("/postform/",HTTP_POST,[&]{++dispatched;server.send(200,"text/plain","ok");});
+ auto postHeaders=[](const std::string &length,const std::string &extra=""){
+  return "POST /postform/ HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: "+length+"\r\n"+extra+"\r\n";
+ };
+ auto rejected=[&](const std::string &request,int expected){
+  auto before=dispatched;WiFiClient client(request);server._server.pending.push_back(client);
+  drainHttp(server,client);assert(!client.socket->open);assert(server.code==expected);assert(dispatched==before);
+  assert(server._currentArgs==nullptr&&server._currentArgCount==0);
+ };
+ rejected("GET /"+std::string(512,'x')+" HTTP/1.1\r\n\r\n",414);
+ rejected("GET / HTTP/1.1\r\nX-Large: "+std::string(5000,'x'),431);
+ rejected(postHeaders("4097"),413);
+ rejected(postHeaders(std::string(80,'9')),413);
+ rejected(postHeaders("-1"),400);
+ rejected(postHeaders("1","Content-Length: 1\r\n"),400);
+ rejected(postHeaders("1","Transfer-Encoding: chunked\r\n"),400);
+ rejected(postHeaders("1","Expect: 100-continue\r\n"),417);
+ rejected("POST /postform/ HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=missing\r\nContent-Length: 10\r\n\r\n",415);
+ rejected("POST /postform/ HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",415);
+ rejected("GET / HTTP/1.1\r\nContent-Length: 1\r\n\r\nx",400);
+ std::string fields="a=x";for(int n=1;n<25;++n)fields+="&a=x";
+ rejected(postHeaders(std::to_string(fields.size()))+fields,413);
+ rejected("GET /?"+fields+" HTTP/1.1\r\n\r\n",413);
+ std::string split="POST /postform/?a=x HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: ";
+ fields.erase(fields.size()-4); // 24 in body plus one in query must still fail.
+ rejected(split+std::to_string(fields.size())+"\r\n\r\n"+fields,413);
+ for(const std::string &body:std::vector<std::string>{"a=%", "a=%0", "a=%GG", "a=%00", std::string("a=x\0y",5)})
+  rejected(postHeaders(std::to_string(body.size()))+body,400);
+ std::string manyHeaders;for(int n=0;n<33;++n)manyHeaders+="X-Test: x\r\n";
+ rejected("GET / HTTP/1.1\r\n"+manyHeaders+"\r\n",431);
 
-
-
-
-
-
-
+ // A rejection must not poison the next connection or bypass normal routing.
+ WiFiClient good("GET / HTTP/1.1\r\n\r\n");server._server.pending.push_back(good);drainHttp(server,good);
+ assert(!good.socket->open&&server.code==200&&dispatched==1);
+ // A body at the size boundary is accepted, with a bounded amount read per call.
+ std::string boundary="a="+std::string(4094,'x');
+ WiFiClient large(postHeaders("4096")+boundary);server._server.pending.push_back(large);
+ auto size=large.socket->input.size();server.handleClient();
+ assert(large.socket->open&&large.socket->input.size()==size-256);
+ drainHttp(server,large);assert(!large.socket->open&&server.code==200&&dispatched==2);
+}
+void testBoundedHttpFormCompatibility(){
+ BoundedWebServer server;server.begin();int dispatched=0;
+ server.on("/postform/",HTTP_POST,[&]{
+  ++dispatched;assert(server.method()==HTTP_POST);assert(server.args()==3);
+  assert(server.arg("token")=="secret");assert(server.arg("mqttPasswd")=="a&b+c d");
+  assert(server.arg("mqttTopic")=="SMA");assert(server.header("Authorization")=="Basic dXNlcjpwYXNz");
+  assert(server._hostHeader=="192.0.2.1");server.send(200,"text/plain","ok");
+ });
+ std::string body="mqttPasswd=a%26b%2Bc+d&mqttTopic=SMA";
+ WiFiClient client("POST /postform/?token=secret HTTP/1.1\r\nhost: 192.0.2.1\r\nauthorization: Basic dXNlcjpwYXNz\r\nContent-Type: application/x-www-form-urlencoded; charset=UTF-8\r\nContent-Length: "+std::to_string(body.size())+"\r\n\r\n"+body);
+ server._server.pending.push_back(client);drainHttp(server,client);
+ assert(dispatched==1&&server.code==200&&!client.socket->open);assert(server.header("Authorization").isEmpty());
+ server.on("/",[&]{++dispatched;assert(server.args()==0);assert(server.header("Authorization").isEmpty());server.send(200,"text/plain","ok");});
+ WiFiClient next("GET / HTTP/1.0\r\n\r\n");server._server.pending.push_back(next);drainHttp(server,next);
+ assert(dispatched==2&&server.code==200&&!next.socket->open);
+}
+void testBoundedHttpDeadline(){
+ for(bool body:{false,true}){
+  BoundedWebServer server;server.begin();int dispatched=0;
+  server.on("/",[&]{++dispatched;server.send(200,"text/plain","ok");});
+  // Exercise the absolute deadline across millis() rollover and keep sending.
+  fake::ticks=UINT32_MAX-1000ULL;
+  WiFiClient client(body?"POST / HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 10\r\n\r\na":"GET / HTTP/1.1\r\nX-Slow: a");
+  server._server.pending.push_back(client);server.handleClient();assert(client.socket->open);
+  for(int n=0;n<4;++n){fake::ticks+=1000;client.socket->input.push_back('x');server.handleClient();assert(client.socket->open);}
+  fake::ticks+=1000;client.socket->input.push_back('x');server.handleClient();
+  assert(!client.socket->open&&server.code==408&&dispatched==0);
+ }
+}
 
 
 
@@ -436,10 +762,35 @@ void testClockTargetsOneInverter(){
  }
  b.sent=nullptr;i.btConnected=false;i.invData=saved;
 }
-
-
-
-
+void testClosedWriteIsVerified(){
+ auto&a=ESP32_SMA_Inverter_App::getInstance();assert(a.saveConfiguration());
+ auto files=fake::files;fake::loseWriteOnClose=true;
+ assert(!a.saveConfiguration());fake::loseWriteOnClose=false;
+ assert(fake::files["/config.txt"]==files["/config.txt"]);
+ assert(fake::files["/config.bak"]==files["/config.bak"]);
+}
+void testMountFailurePreservesFiles(){
+ auto&a=ESP32_SMA_Inverter_App::getInstance();auto config=a.appConfig;auto files=fake::files;
+ auto formats=fake::formats;fake::mountable=false;a.configSetup();
+ assert(fake::formats==formats);assert(fake::files==files);assert(!a.saveConfiguration());
+ fake::mountable=true;a.configurationStorageAvailable=true;a.appConfig=config;
+}
+void testLargeEscapedConfiguration(){
+ auto&a=ESP32_SMA_Inverter_App::getInstance();auto&m=ESP32_SMA_MQTT::getInstance();auto config=a.appConfig;
+ a.appConfig.ntphostname=std::string(2000,'"');m.formPage();assert(a.webServer.code==503);
+ a.appConfig.ntphostname=std::string(1300,'&');m.formPage();
+ assert(a.webServer.code==200||a.webServer.code==503);assert(a.webServer.body.length()<10000);
+ a.appConfig=config;
+}
+void testPasswordWhitespace(){
+ auto&a=ESP32_SMA_Inverter_App::getInstance();auto&m=ESP32_SMA_MQTT::getInstance();auto config=a.appConfig;
+ m.settingsToken="secret";a.webServer.params={{"token","secret"},{"mqttPasswd"," secret "},{"smapw"," 0000 "}};
+ try{m.handleForm();assert(false);}catch(const fake::Restart&){}
+ assert(a.appConfig.mqttPasswd==" secret ");assert(a.appConfig.smaInvPass==" 0000 ");
+ StaticJsonDocument<2048> json;assert(!deserializeJson(json,fake::files["/config.txt"]));
+ assert(json["mqttPasswd"]==" secret ");assert(json["smaInvPass"]==" 0000 ");
+ a.appConfig=config;assert(a.saveConfiguration());
+}
 void testStaleErrorIsIgnored(){
  auto&i=ESP32_SMA_Inverter::getInstance();auto&b=i.serialBT;auto record=numericRecord(GridMsTotW,1,1234);
  b.input.clear();b.output.clear();b.sent=[&]{auto stale=response(i,record,1,1,E_LRINOTAVAIL);
@@ -686,6 +1037,9 @@ void testBluetoothAuthRecoveryMatchesTargetPeer(){
 
 
 int main(){
+ testBoundedHttpRequests();
+ testBoundedHttpFormCompatibility();
+ testBoundedHttpDeadline();
  testClockReplyCorrelation();
  testClockTargetsOneInverter();
  testLoginAndInitCrc();
@@ -701,6 +1055,16 @@ int main(){
  testSlowPacketDeadline();
  testCallerOperationDeadlinesAndRollover();
  testBluetoothTimerRollover();
+ testExcessFormArguments();
+ testSettingsToken();
+ testNtpInput();
+ testConfigRecovery();
+ testSerialConfigPersistenceAndValidation();
+ testSaveFailures();
+ testClosedWriteIsVerified();
+ testMountFailurePreservesFiles();
+ testLargeEscapedConfiguration();
+ testPasswordWhitespace();
  testStaleErrorIsIgnored();
  testMalformedPacketClearsSession();
  testManyValidFragments();
@@ -711,6 +1075,8 @@ int main(){
  testClockExpiresDuringRead();
  testConnectRetainsEarlyHandshakeAndCleansFailedSession();
  testBluetoothAuthRecoveryMatchesTargetPeer();
+ testNumericSettingsValidation();
+ testTimezoneConfigurationReload();
  InverterData identity{}; identity.SUSyID=0x1234; assert(identity.SUSyID==0x1234);
  uint8_t bytes[]={0x78,0x56,0x34,0x12,0,0,0,0};
  assert(get_u16(bytes)==0x5678);

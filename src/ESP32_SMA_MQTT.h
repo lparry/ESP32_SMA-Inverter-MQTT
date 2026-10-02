@@ -21,6 +21,7 @@
 #include "ConfigDefaults.h"
 #include "ESP32Loggable.h"
 
+struct AppConfig;
 
 class ESP32_SMA_MQTT : public ESP32Loggable  {
 
@@ -43,16 +44,17 @@ public:
      void mySmartConfig();
      void showSmartConfigConfirmation();
      void connectAP();
-     void wifiLoop();
+     void wifiLoop(bool receiveWait = false);
      void formPage ();
      void handleForm();
      void handleSetClock();
      bool brokerConnect();
-     bool publishData();
-     bool publishEspStatus();
+     bool publishData(const InverterData *reading = nullptr, const DisplayData *display = nullptr);
+     bool publishEspStatus(bool serviceDiscovery = true);
      bool hassAutoDiscover(int timeout);
      bool sendLongMQTT(const char *topic, const char *postscript, const char *msg);
      void logViaMQTT(const char *logStr);
+     bool prepareDiscovery(const AppConfig& config);
 
     String getTime();
 
@@ -64,14 +66,28 @@ protected:
     std::map<int, std::string> codeMap;
 
 private:
+    uint32_t energySerial = 0;
+    void loadEnergyBaseline(uint32_t serial);
     uint64_t lastAcceptedETotalWh = 0;
     uint64_t lastPersistedETotalWh = 0;
+    bool energyBaselineLoaded = false;
+    bool energyBaselinePersisted = false;
+    bool persistEnergyBaseline(uint32_t serial, uint64_t energyWh);
     bool discoveryPublishOK = true;
     bool espDiscoveryPublished = false;
     uint32_t espDiscoveredSerial = 0;
     unsigned long lastEspStatusMillis = 0;
     String clockSyncToken;
     String smartConfigToken;
+    String settingsToken;
+    bool ntpStarted = false;
+    bool discoveryIdentityLoaded = false;
+    String discoveryIdentity;
+    bool discoveryMigrationAttempted = false;
+    uint32_t lastDiscoveryMigrationAttemptMillis = 0;
+    bool loadDiscoveryIdentity();
+    bool saveDiscoveryIdentity(const String& identity);
+    bool removeDiscovery(const String& identity);
     // Private constructor to prevent instantiation from outside the class.
     ESP32_SMA_MQTT() : ESP32Loggable("ESP32_SMA_MQTT") {
          initMap();
@@ -120,6 +136,9 @@ private:
     void sendSensorValue(char *tmpstr, const char *topic, const int timeout);
     bool publishEspDiscovery(const char *stateTopic);
 
+    void sendHassDiscovery(char *msg, size_t size, int timeout, const char *topic,
+                           const char *name, const char *unit, const char *sensor,
+                           const char *id, const char *deviceClass, const char *stateClass, bool force);
     void sendHassAuto(char *msg, size_t msg_size, int timeout, const char *topic, const char *devclass, const char *stateclass, const char *forceupdate,
                                       const char *devname, const char *unitOf, const char *sensortype,
                                       const char *sensortypeid);
