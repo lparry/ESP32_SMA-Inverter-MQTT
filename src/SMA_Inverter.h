@@ -29,6 +29,9 @@ SOFTWARE.
 #include "SMA_Inverter.h"
 #include "SMA_Utils.h"
 #include "BluetoothSerial.h"
+#include <atomic>
+#include <array>
+#include <cmath>
 
 #include "ESP32Loggable.h"
 
@@ -63,6 +66,7 @@ SOFTWARE.
 
 
 enum E_RC {
+    E_LRINOTAVAIL =   21,   // Inverter does not implement the requested reading
     E_OK =            0,    // No error
     E_INIT =         -1,    // Unable to initialise
     E_INVPASSW =     -2,    // Invalid password
@@ -74,11 +78,12 @@ enum E_RC {
     E_CHKSUM =       -8,    // Invalid checksum
     E_INVRESP =      -9,    // Invalid response
     E_ARCHNODATA =   -10,   // no archive data
+    E_EXPIRED =      -11,   // authorized clock request expired before its write
 };
 
 struct InverterData {
     uint8_t BTAddress[6];
-    uint8_t SUSyID;
+    uint16_t SUSyID;
     uint32_t Serial;
     uint8_t NetID;
     int32_t Pmax;
@@ -93,6 +98,8 @@ struct InverterData {
     int32_t InvTemp;
     uint64_t EToday;
     uint64_t ETotal;
+    bool ETodayValid = false;
+    bool ETotalValid = false;
   //DayData dayData[288];
     uint64_t dayWh[ARCH_DAY_SIZE];
   //int32_t dayW[ARCH_DAY_SIZE];
@@ -102,8 +109,8 @@ struct InverterData {
     time_t   LastTime;
     uint64_t OperationTime;
     uint64_t FeedInTime;
-    int32_t DevStatus;
-    int32_t GridRelay;
+    int32_t DevStatus = 0xFFFFFD;
+    int32_t GridRelay = 0xFFFFFD;
     E_RC     status;
 };
 
@@ -112,7 +119,7 @@ struct InverterData {
 
 
 struct DisplayData {
-  float BTSigStrength;
+  float BTSigStrength = NAN;
   float Pmax;
   float Pac;
   float Uac[3];
@@ -248,7 +255,8 @@ class ESP32_SMA_Inverter : public ESP32Loggable {
 
     //Prototypes
     bool isValidSender(uint8_t expAddr[6], uint8_t isAddr[6]);
-    E_RC getPacket(uint8_t expAddr[6], int wait4Command);
+    E_RC getPacket(uint8_t expAddr[6], int wait4Command,
+                   const uint32_t *callerDeadline = nullptr);
     void writePacketHeader(uint8_t *buf, const uint16_t control, const uint8_t *destaddress);
     E_RC getInverterDataCfl(uint32_t command, uint32_t first, uint32_t last);
     E_RC getInverterData(enum getInverterDataType type);
@@ -256,18 +264,22 @@ class ESP32_SMA_Inverter : public ESP32Loggable {
     E_RC initialiseSMAConnection();
     E_RC logonSMAInverter(const char *password, const uint8_t user);
     void logoffSMAInverter();
-    E_RC syncPlantTime(int32_t utcOffsetSeconds, int32_t *beforeTime, int32_t *afterTime);
+    E_RC syncPlantTime(int32_t utcOffsetSeconds, int32_t *beforeTime, int32_t *afterTime,
+                       const uint32_t *requestDeadline = nullptr);
 
     E_RC ArchiveDayData(time_t startTime);
     E_RC ReadCurrentData();
 
     bool connect(uint8_t remoteAddress[]);
     bool disconnect();
+    bool unpair(uint8_t remoteAddress[]);
+    bool takeReconnectRequest();
+    void setServiceCallback(void (*callback)()) { serviceCallback = callback; }
 
 
     //Prototypes
-    uint8_t BTgetByte();
-    void BTsendPacket( uint8_t *btbuffer );
+    uint8_t BTgetByte(const uint32_t *callerDeadline = nullptr);
+    bool BTsendPacket(uint8_t *btbuffer);
     void writeByte(uint8_t *btbuffer, uint8_t v);
     void write32(uint8_t *btbuffer, uint32_t v);
     void write16(uint8_t *btbuffer, uint16_t v);
@@ -278,7 +290,7 @@ class ESP32_SMA_Inverter : public ESP32Loggable {
     bool validateChecksum();
     bool isCrcValid(uint8_t lb, uint8_t hb);
 
-    uint32_t getattribute(uint8_t *pcktbuf);
+    uint32_t getattribute(uint8_t *pcktbuf, size_t recordsize);
 
     void setPcktID(uint8_t pPcktID) {
         pcktID = pPcktID;
@@ -313,11 +325,34 @@ class ESP32_SMA_Inverter : public ESP32Loggable {
 
     BluetoothSerial serialBT = BluetoothSerial();
 
+    // BluetoothSerial 2.0.9's default RX queue is only 512 bytes. Its onData
+    // callback lets the SPP task copy bytes here while web/MQTT work runs.
+    // Two maximum SMA frames leave room for one response plus queued follow-up.
+    static constexpr uint32_t BT_RX_QUEUE_CAPACITY = COMMBUFSIZE * 2;
+    static_assert((BT_RX_QUEUE_CAPACITY & (BT_RX_QUEUE_CAPACITY - 1)) == 0,
+                  "Bluetooth RX queue capacity must be a power of two");
+    std::array<uint8_t, BT_RX_QUEUE_CAPACITY> btRxQueue{};
+    std::atomic<uint32_t> btRxHead{0};
+    std::atomic<uint32_t> btRxTail{0};
+    std::atomic<bool> btRxOverflow{false};
+    std::atomic<bool> btRxCallbackActive{false};
+    std::atomic<bool> btRxCallbackBusy{false};
+    std::atomic<bool> discardBtRx{false};
+    void enqueueBluetoothData(const uint8_t *data, size_t length);
+    bool readBluetoothByte(uint8_t *value);
+
+    // getInverterDataCfl parses into the public data structures as packets
+    // arrive. Keep rollback storage in the singleton, off the 8 KB loop stack.
+    InverterData cflSnapshot = {};
+    DisplayData cflDisplaySnapshot = {};
+
     uint8_t  btrdBuf[COMMBUFSIZE];
     uint16_t pcktBufMax = 0; // max. used size of PcktBuf
     uint8_t  espBTAddress[6]; // is retrieved from BT packet
 
     bool btConnected = false;
+    bool authRecoveryAttempted = false;
+    bool reconnectRequested = false;
 
     char timeBuf[24];
   //from SMA_Bluetooth
@@ -325,6 +360,14 @@ class ESP32_SMA_Inverter : public ESP32Loggable {
         uint16_t pcktBufPos = 0;
         uint16_t pcktID = 1;
         bool readTimeout = false;
+        bool receivingPacket = false;
+        uint32_t receiveStarted = 0;
+        void (*serviceCallback)() = nullptr;
+        uint32_t lastServiceMillis = 0;
+        bool servicing = false;
+        void serviceBackground();
+        void clearReceiveQueue();
+        E_RC failReceive(E_RC error);
         uint16_t fcsChecksum=0xffff;
         uint8_t sixzeros[6]= {0x00,0x00,0x00,0x00,0x00,0x00};
         uint8_t sixff[6]   = {0xff,0xff,0xff,0xff,0xff,0xff};

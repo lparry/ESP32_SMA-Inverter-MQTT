@@ -28,6 +28,6 @@ with tempfile.TemporaryDirectory(prefix='sma-host-') as tmp:
            '-DARDUINOJSON_ENABLE_ARDUINO_STRING=1','-DARDUINOJSON_ENABLE_ARDUINO_STREAM=0',
            '-DARDUINOJSON_ENABLE_ARDUINO_PRINT=0',
            '-I'+str(ROOT/'tests/host/stubs'),'-I'+str(sources),'-I'+str(JSON),
-           *[str(sources/n) for n in ('SMA_Utils.cpp','SMA_Inverter.cpp','ESP32_SMA_Inverter_App.cpp','ESP32_SMA_MQTT.cpp')],str(ROOT/'tests/host/test.cpp'),'-o',str(tmp/'tests')]
+           *[str(sources/n) for n in ('SMA_Utils.cpp','BluetoothAuthObserver.cpp','SMA_Inverter.cpp','ESP32_SMA_Inverter_App.cpp','ESP32_SMA_MQTT.cpp')],str(ROOT/'tests/host/gap_sdk_fake.cpp'),str(ROOT/'tests/host/test.cpp'),'-o',str(tmp/'tests')]
     subprocess.run(cmd,check=True)
     subprocess.run([str(tmp/'tests')],check=True)
