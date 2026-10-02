@@ -80,7 +80,11 @@ static String formatLocalEpoch(int32_t epoch) {
   return String(formatted);
 }
 
-
+static uint32_t measurementExpirySeconds(bool nightTime, int scanRate) {
+  return nightTime
+      ? static_cast<uint32_t>(max(2700, (NIGHTSCANRATE / 1000) * 3))
+      : static_cast<uint32_t>(max(300, constrain(scanRate, 10, 3600) * 3 + 60));
+}
 
 static float configuredTimezoneFallback() {
   const float configured = static_cast<float>(TIMEZONE);
@@ -129,11 +133,16 @@ void ESP32_SMA_Inverter_App::appSetup() {
   DisplayData& dispData = ESP32_SMA_Inverter::getInstance().dispData;  
 
 
-  if ( !smartConfig) {
-    // Convert the MAC address string to binary
-    sscanf(appConfig.smaBTAddress.c_str(), "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx", 
-            &smaBTAddress[0], &smaBTAddress[1], &smaBTAddress[2], &smaBTAddress[3], &smaBTAddress[4], &smaBTAddress[5]);
-    // Zero the array, all unused butes must be 0
+  if (!smartConfig) {
+    uint8_t parsedAddress[6];
+    if (!parseSmaBluetoothAddress(appConfig.smaBTAddress, parsedAddress)) {
+      bluetoothAddressValid = false;
+      logE("Invalid inverter Bluetooth address; Bluetooth polling is disabled");
+      return;
+    }
+    for (uint8_t i = 0; i < 6; ++i) smaBTAddress[i] = parsedAddress[i];
+    bluetoothAddressValid = true;
+
     for(int i = 0; i < sizeof(smaInvPass);i++)
        smaInvPass[i] ='\0';
     strlcpy(smaInvPass , appConfig.smaInvPass.c_str(), sizeof(smaInvPass));
@@ -147,7 +156,8 @@ void ESP32_SMA_Inverter_App::appSetup() {
                 invData.BTAddress[5], invData.BTAddress[4], invData.BTAddress[3],
                 invData.BTAddress[2], invData.BTAddress[1], invData.BTAddress[0]);
     // *** Start BT
-    smaInverter.begin("ESP32toSMA", true); // "true" creates this device as a BT Master.
+    initializeBluetoothIfDue(); // "true" creates this device as a BT Master.
+    logW("USB commands: unpair (remove inverter bond and retry), poll (read now)");
   }
   // *** Start WIFI and WebServer
 
@@ -159,28 +169,41 @@ void loop() {
 }
 
 void ESP32_SMA_Inverter_App::appLoop() { 
+  mqttInstanceForApp.wifiLoop();
+  handleSerialCommands();
+  initializeBluetoothIfDue();
   int adjustedScanRate;
   struct tm timeinfo;
   InverterData& invData = ESP32_SMA_Inverter::getInstance().invData;
   DisplayData& dispData = ESP32_SMA_Inverter::getInstance().dispData;
-  bool ntpWorking = getLocalTime(&timeinfo);
+  bool ntpWorking = getLocalTime(&timeinfo, 0);
 
   if (clockSyncRequested && (int32_t)(millis() - clockSyncRequestDeadline) >= 0) {
     clockSyncRequested = false;
     clockSyncStatus = "Request expired before an inverter connection was available";
   }
 
-// Check if the Sun is up or the grid relay is closed
-  if ((ntpWorking && (timeinfo.tm_hour >= SUNUP) && (timeinfo.tm_hour < SUNDOWN)) || (invData.GridRelay == 51)){
+  const uint32_t relayFreshnessMs = max(120, constrain(appConfig.scanRate, 10, 3600) * 2) * 1000UL;
+  const bool freshClosedRelay = hasSuccessfulRead && invData.GridRelay == 51 &&
+      (uint32_t)(millis() - lastSuccessfulReadMillis) < relayFreshnessMs;
+// Check if the Sun is up or a recent reading reports the grid relay closed
+  if ((ntpWorking && (timeinfo.tm_hour >= SUNUP) && (timeinfo.tm_hour < SUNDOWN)) || freshClosedRelay){
     nightTime = false;
     adjustedScanRate = constrain(appConfig.scanRate, 10, 3600) * 1000;
   } else {
     nightTime = true;
     adjustedScanRate = NIGHTSCANRATE;
   }
+  if (lastAdjustedScanRate > adjustedScanRate) {
+    const uint32_t fasterDeadline = millis() + (uint32_t)adjustedScanRate;
+    if ((int32_t)(nextTime - fasterDeadline) > 0) nextTime = fasterDeadline;
+  }
+  lastAdjustedScanRate = adjustedScanRate;
   // connect or reconnect after connection lost 
-  bool freshData = false;
-  if (!smartConfig && ((int32_t)(millis() - nextTime) >= 0) && (!smaInverter.isBtConnected())) {
+  if (!smartConfig && bluetoothReady && bluetoothAddressValid &&
+      ((int32_t)(millis() - nextTime) >= 0) && (!smaInverter.isBtConnected())) {
+    pollingInProgress = true;
+    struct PollGuard { bool& active; ~PollGuard() { active = false; } } pollGuard{pollingInProgress};
     nextTime = millis() + adjustedScanRate;
     if(nightTime)
       logW("Night time - 15min scans\n");
@@ -212,12 +235,15 @@ void ESP32_SMA_Inverter_App::appLoop() {
       if (rc == E_OK && clockSyncRequested) {
         // Clear before attempting: every button press permits exactly one write attempt.
         clockSyncRequested = false;
+        const uint32_t requestDeadline = clockSyncRequestDeadline;
         int32_t beforeTime = 0;
         int32_t afterTime = 0;
         int32_t utcOffsetSeconds = (int32_t)lroundf(appConfig.timezone * 3600.0f);
-        E_RC clockRc = smaInverter.syncPlantTime(utcOffsetSeconds, &beforeTime, &afterTime);
+        E_RC clockRc = smaInverter.syncPlantTime(utcOffsetSeconds, &beforeTime, &afterTime, &requestDeadline);
         if (clockRc == E_OK) {
           clockSyncStatus = "Verified: " + formatLocalEpoch(beforeTime) + " -> " + formatLocalEpoch(afterTime);
+        } else if (clockRc == E_EXPIRED) {
+          clockSyncStatus = "Request expired before the clock write; inverter clock unchanged";
         } else {
           clockSyncStatus = "Clock sync failed with code " + String((int)clockRc) + "; no automatic retry";
           logW("Clock sync failed (%d)", clockRc);
@@ -228,7 +254,14 @@ void ESP32_SMA_Inverter_App::appLoop() {
         DisplayData previousDispData = dispData;
         rc = smaInverter.ReadCurrentData();
         if (rc == E_OK) {
-          freshData = true;
+          pendingReading = invData;
+          pendingDisplay = dispData;
+          pendingReadingAcquiredMillis = millis();
+          pendingReadingMaxAgeMillis = measurementExpirySeconds(nightTime, appConfig.scanRate) * 1000UL;
+          readingPending = true;
+          nextPublishAttempt = millis();
+          hasSuccessfulRead = true;
+          lastSuccessfulReadMillis = millis();
         } else {
           invData = previousInvData;
           dispData = previousDispData;
@@ -246,6 +279,7 @@ void ESP32_SMA_Inverter_App::appLoop() {
 //       mqttInstanceForApp.publishData();
       failCount=0;
     } else { 
+      if (smaInverter.takeReconnectRequest()) nextTime = millis() + 1000UL;
       // Inverter shuts down at night so no bluetooth. Don't bother rebooting, just keep trying 
       if (!nightTime) {
         mqttInstanceForApp.logViaMQTT("Bluetooth failed to connect");
@@ -260,7 +294,13 @@ void ESP32_SMA_Inverter_App::appLoop() {
   
   if (invData.Serial != 0 && appConfig.thisSerial != invData.Serial) {
     appConfig.thisSerial = invData.Serial;
-    ESP32_SMA_Inverter_App::getInstance().saveConfiguration();
+    serialSavePending = true;
+    nextSerialSaveAttempt = millis();
+  }
+  if (serialSavePending && (int32_t)(millis() - nextSerialSaveAttempt) >= 0) {
+    nextSerialSaveAttempt = millis() + 30000UL;
+    if (saveConfiguration()) serialSavePending = false;
+    else logW("Inverter serial save failed; will retry");
   }
   // Discovery carries the sensor expiry. Update it when the polling mode changes,
   // even if the inverter has gone to sleep and no new reading can be published.
@@ -269,9 +309,7 @@ void ESP32_SMA_Inverter_App::appLoop() {
       currentSerial != 0 &&
       (firstTime || nightTime != dayNight || currentSerial != discoveredSerial) &&
       (int32_t)(millis() - nextDiscoveryAttempt) >= 0) {
-    const int expiry = nightTime
-        ? max(2700, (NIGHTSCANRATE / 1000) * 3)
-        : max(300, constrain(appConfig.scanRate, 10, 3600) * 3 + 60);
+    const int expiry = measurementExpirySeconds(nightTime, appConfig.scanRate);
     nextDiscoveryAttempt = millis() + 60000UL;
     if (mqttInstanceForApp.hassAutoDiscover(expiry)) {
       if (firstTime) mqttInstanceForApp.logViaMQTT("First boot");
@@ -281,9 +319,18 @@ void ESP32_SMA_Inverter_App::appLoop() {
       discoveredSerial = currentSerial;
     }
   }
-  // Publish the fresh, non-retained reading after Home Assistant has its discovery config.
-  if (freshData) {
-    mqttInstanceForApp.publishData();
+  // Retry the most recent complete reading until it is published or superseded.
+  const bool discoveryReady = !appConfig.hassDisc ||
+      (!firstTime && discoveredSerial == pendingReading.Serial);
+  if (readingPending &&
+      (uint32_t)(millis() - pendingReadingAcquiredMillis) >= pendingReadingMaxAgeMillis) {
+    readingPending = false;
+    logW("Discarding stale queued inverter reading");
+  }
+  if (readingPending && discoveryReady && WiFi.status() == WL_CONNECTED &&
+      (int32_t)(millis() - nextPublishAttempt) >= 0) {
+    nextPublishAttempt = millis() + 5000UL;
+    if (mqttInstanceForApp.publishData(&pendingReading, &pendingDisplay)) readingPending = false;
   }
   // DEBUG1_PRINT(".");
   mqttInstanceForApp.wifiLoop();
@@ -292,9 +339,69 @@ void ESP32_SMA_Inverter_App::appLoop() {
   delay(100);
 }
 
+void ESP32_SMA_Inverter_App::handleSerialCommands() {
+  while (Serial.available()) {
+    char ch = Serial.read();
+    if (ch == '\r') continue;
+    if (ch == '\n') {
+      serialCommand[serialCommandLength] = '\0';
+      if (!serialCommandOverflow && !smartConfig) {
+        if (strcmp(serialCommand, "unpair") == 0) {
+          if (!bluetoothAddressValid) logE("Cannot unpair: inverter Bluetooth address is invalid");
+          else if (!bluetoothReady) logE("Cannot unpair: Bluetooth is still initializing");
+          else {
+            logW("USB unpair command: removing configured inverter bond");
+            if (smaInverter.unpair(smaBTAddress)) nextTime = millis() + 250UL;
+          }
+        } else if (strcmp(serialCommand, "poll") == 0) {
+          if (bluetoothAddressValid) {
+            logW("%s", bluetoothReady ? "USB poll command: requesting inverter read"
+                                      : "USB poll command: queued until Bluetooth initializes");
+            nextTime = millis();
+          } else logE("Cannot poll: inverter Bluetooth address is invalid");
+        } else if (strcmp(serialCommand, "format-config") == 0) {
+          logW("USB format-config command: erasing the settings filesystem");
+          configurationStorageAvailable = LittleFS.format() && LittleFS.begin(false);
+          if (configurationStorageAvailable) pendingRecoveryFile = nullptr;
+          if (configurationStorageAvailable && saveConfiguration()) {
+            logW("Settings filesystem initialized with the current configuration");
+          } else logE("Settings filesystem initialization failed");
+        }
+      }
+      serialCommandLength = 0;
+      serialCommandOverflow = false;
+    } else if (serialCommandLength < sizeof(serialCommand) - 1) {
+      serialCommand[serialCommandLength++] = ch;
+    } else {
+      serialCommandOverflow = true;
+    }
+  }
+}
 
+void ESP32_SMA_Inverter_App::initializeBluetoothIfDue() {
+  if (smartConfig || !bluetoothAddressValid || bluetoothReady) return;
+  if (bluetoothInitRetryScheduled &&
+      (int32_t)(millis() - nextBluetoothInitAttempt) < 0) return;
 
+  const uint32_t retryDelay = bluetoothInitRetryMs;
+  if (!smaInverter.begin("ESP32toSMA", true)) {
+    // A failed core begin can leave controller/SPP resources partially
+    // initialized. ESP32_SMA_Inverter::begin tears those down before retrying.
+    smaInverter.setServiceCallback(nullptr);
+    nextBluetoothInitAttempt = millis() + retryDelay;
+    bluetoothInitRetryScheduled = true;
+    bluetoothInitRetryMs = retryDelay >= 30000UL ? 60000UL : retryDelay * 2;
+    logW("Bluetooth initialization failed; retrying in %lu ms",
+         static_cast<unsigned long>(retryDelay));
+    return;
+  }
 
+  bluetoothReady = true;
+  bluetoothInitRetryScheduled = false;
+  bluetoothInitRetryMs = 1000UL;
+  smaInverter.setServiceCallback([]() { mqttInstanceForApp.wifiLoop(true); });
+  logI("Bluetooth initialized");
+}
 
 void ESP32_SMA_Inverter_App::requestClockSync() {
   time_t now = time(nullptr);

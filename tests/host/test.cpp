@@ -504,16 +504,67 @@ void testBoundedHttpDeadline(){
   assert(!client.socket->open&&server.code==408&&dispatched==0);
  }
 }
-
+void testMissingNtpDoesNotBlock(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();
+ fake::validTime=false;fake::maxTimeWait=0;fake::ticks=1000000;a.nextTime=1100000;
+ auto start=fake::ticks;bool discovery=a.appConfig.hassDisc;a.appConfig.hassDisc=false;assert(m.getTime().isEmpty());a.appLoop();m.formPage();a.appConfig.hassDisc=discovery;
+ assert(fake::maxTimeWait==0);assert(fake::ticks-start<500);
+ fake::validTime=true;
+}
 void testLateWifiStartsNtp(){
  auto&m=ESP32_SMA_MQTT::getInstance();m.ntpStarted=false;fake::ntpCalls=0;
  WiFi.state=0;m.wifiLoop();assert(fake::ntpCalls==0);
  WiFi.state=WL_CONNECTED;m.wifiLoop();assert(fake::ntpCalls==1);
  m.wifiLoop();assert(fake::ntpCalls==1);
 }
-
-
-
+void testStaleRelayExpires(){
+ auto&a=ESP32_SMA_Inverter_App::getInstance();
+ fake::validTime=false;fake::ticks=2000000;a.nextTime=3000000;
+ a.appConfig.scanRate=60;ESP32_SMA_Inverter::invData.GridRelay=51;
+ a.hasSuccessfulRead=true;a.lastSuccessfulReadMillis=2000000;
+ a.appLoop();assert(!a.nightTime);
+ fake::ticks+=121000;a.appLoop();assert(a.nightTime);
+ a.hasSuccessfulRead=false;fake::validTime=true;
+}
+void testNightToDayShortensPollDeadline(){
+ auto&a=ESP32_SMA_Inverter_App::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();
+ auto config=a.appConfig;const auto oldNextTime=a.nextTime;const auto oldRate=a.lastAdjustedScanRate;
+ const auto oldNightTime=a.nightTime;const auto oldRead=a.hasSuccessfulRead;const auto oldReadAt=a.lastSuccessfulReadMillis;
+ const auto oldSerial=i.invData.Serial;const auto oldRelay=i.invData.GridRelay;const auto oldThisSerial=a.appConfig.thisSerial;
+ const auto oldValidTime=fake::validTime;const auto oldHour=fake::localHourOverride;const auto oldTicks=fake::ticks;
+ a.appConfig.scanRate=10;a.appConfig.hassDisc=false;a.appConfig.mqttBroker="";a.appConfig.thisSerial=0;
+ i.invData.Serial=0;i.invData.GridRelay=0;a.hasSuccessfulRead=false;a.lastAdjustedScanRate=0;
+ fake::ticks=5000000;fake::validTime=false;fake::localHourOverride=-1;
+ const uint32_t scheduledAt=millis();a.nextTime=scheduledAt+NIGHTSCANRATE;
+ a.appLoop();assert(a.nightTime);const uint32_t nightDeadline=a.nextTime;
+ assert(a.lastAdjustedScanRate==NIGHTSCANRATE);
+ fake::ticks+=NIGHTSCANRATE/2;fake::validTime=true;fake::localHourOverride=6;
+ a.appLoop();assert(!a.nightTime);assert(a.nextTime!=nightDeadline);
+ assert((int32_t)(a.nextTime-nightDeadline)<0);
+ const int32_t remaining=(int32_t)(a.nextTime-millis());assert(remaining>0&&remaining<=10000);
+ a.appConfig=config;a.nextTime=oldNextTime;a.lastAdjustedScanRate=oldRate;a.nightTime=oldNightTime;
+ a.hasSuccessfulRead=oldRead;a.lastSuccessfulReadMillis=oldReadAt;i.invData.Serial=oldSerial;i.invData.GridRelay=oldRelay;
+ a.appConfig.thisSerial=oldThisSerial;fake::validTime=oldValidTime;fake::localHourOverride=oldHour;fake::ticks=oldTicks;
+}
+void testFasterModePreservesEarlierDeadlineAcrossRollover(){
+ auto&a=ESP32_SMA_Inverter_App::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();
+ auto config=a.appConfig;const auto oldNextTime=a.nextTime;const auto oldRate=a.lastAdjustedScanRate;
+ const auto oldNightTime=a.nightTime;const auto oldRead=a.hasSuccessfulRead;const auto oldReadAt=a.lastSuccessfulReadMillis;
+ const auto oldSerial=i.invData.Serial;const auto oldRelay=i.invData.GridRelay;const auto oldThisSerial=a.appConfig.thisSerial;
+ const auto oldValidTime=fake::validTime;const auto oldHour=fake::localHourOverride;const auto oldTicks=fake::ticks;
+ a.appConfig.scanRate=10;a.appConfig.hassDisc=false;a.appConfig.mqttBroker="";a.appConfig.thisSerial=0;
+ i.invData.Serial=0;i.invData.GridRelay=0;a.hasSuccessfulRead=false;a.lastAdjustedScanRate=0;
+ fake::ticks=uint64_t(UINT32_MAX)-3000;fake::validTime=false;fake::localHourOverride=-1;
+ a.nextTime=millis()+NIGHTSCANRATE;a.appLoop();assert(a.nightTime);
+ // Model an already queued explicit/retry deadline that falls before the new day scan.
+ const uint32_t earlierDeadline=millis()+5000;a.nextTime=earlierDeadline;
+ fake::validTime=true;fake::localHourOverride=6;a.appLoop();assert(!a.nightTime);
+ assert(a.nextTime==earlierDeadline);
+ const int32_t remaining=(int32_t)(a.nextTime-millis());assert(remaining>0&&remaining<5000);
+ a.appConfig=config;a.nextTime=oldNextTime;a.lastAdjustedScanRate=oldRate;a.nightTime=oldNightTime;
+ a.hasSuccessfulRead=oldRead;a.lastSuccessfulReadMillis=oldReadAt;i.invData.Serial=oldSerial;i.invData.GridRelay=oldRelay;
+ a.appConfig.thisSerial=oldThisSerial;fake::validTime=oldValidTime;fake::localHourOverride=oldHour;fake::ticks=oldTicks;
+}
 void testBluetoothTimerRollover(){
  auto&i=ESP32_SMA_Inverter::getInstance();auto&b=i.serialBT;
  b.input.clear();fake::ticks=UINT32_MAX-25ULL;auto start=fake::ticks;
@@ -1358,10 +1409,189 @@ void testBluetoothAuthRecoveryMatchesTargetPeer(){
  i.disconnect();b.duringConnect=savedDuringConnect;b.connectResult=savedConnectResult;
  i.invData=savedIdentity;i.pcktID=savedId;
 }
+void testServicesRunDuringReceive(){
+ auto&i=ESP32_SMA_Inverter::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&m=ESP32_SMA_MQTT::getInstance();
+ auto config=a.appConfig;auto savedOnLoop=a.client.onLoop;
+ auto savedWiFiStatus=WiFi.onStatus;auto savedResponseWrite=a.webServer.onResponseWrite;
+ const bool savedOnline=a.client.online,savedPublishOK=a.client.publishOK;
+ const bool savedDiscoveryLoaded=m.discoveryIdentityLoaded;const String savedDiscoveryIdentity=m.discoveryIdentity;
+ const unsigned long savedStatusTime=m.lastEspStatusMillis;const int wifiState=WiFi.state;
+ a.appConfig.mqttBroker="broker";a.appConfig.hassDisc=false;WiFi.state=WL_CONNECTED;
+ a.client.online=true;a.client.publishOK=true;a.client.messages.clear();a.client.loops=0;
+ m.discoveryIdentityLoaded=true;m.discoveryIdentity="";m.lastEspStatusMillis=0;
+ i.serialBT.input.clear();i.lastServiceMillis=millis()-100;
+ assert(i.begin("receive-buffer-regression",true));
+ i.serialBT.connectResult=true;uint8_t btAddress[6]={};assert(i.connect(btAddress));
+ std::vector<uint8_t> frame(COMMBUFSIZE);
+ for(size_t n=0;n<frame.size();++n)frame[n]=static_cast<uint8_t>(n);
+ bool injected=false,slowMqttLoopEntered=false,slowHttpWriteEntered=false;
+ a.client.onLoop=[&]{slowMqttLoopEntered=true;fake::ticks+=25000UL;};
+ a.webServer.on("/slow-response-test",HTTP_GET,[&]{a.webServer.send(200,"text/plain","delayed response");});
+ a.webServer.onResponseWrite=[&](size_t){slowHttpWriteEntered=true;fake::ticks+=25000UL;};
+ WiFi.onStatus=[&]{if(!injected){injected=true;i.serialBT.inject(frame.data(),frame.size());}};
+ WiFiClient httpRequest("GET /slow-response-test HTTP/1.1\r\nHost: test\r\n\r\n");
+ a.webServer._server.pending.push_back(httpRequest);
+ i.setServiceCallback([]{ESP32_SMA_MQTT::getInstance().wifiLoop(true);});
+ auto loops=a.client.loops;auto handles=fake::httpAcceptPolls;assert(i.BTgetByte()==frame[0]);
+ assert(!i.readTimeout);assert(injected);assert(a.client.loops==loops);assert(!slowMqttLoopEntered);
+ assert(a.client.messages.empty());assert(fake::httpAcceptPolls==handles);
+ assert(!slowHttpWriteEntered);assert(httpRequest.socket->open);
+ assert(i.BTgetByte()==frame[1]);
+ for(size_t n=2;n<frame.size();++n)assert(i.BTgetByte()==frame[n]);
+ WiFi.onStatus=nullptr;
+ const uint64_t normalStart=fake::ticks;m.wifiLoop();
+ assert(slowMqttLoopEntered);assert(a.client.loops==loops+1);assert(fake::ticks-normalStart>=25000UL);
+ assert(fake::httpAcceptPolls==handles+1);assert(slowHttpWriteEntered);
+ assert(!httpRequest.socket->open);assert(a.webServer.body=="delayed response");
+ bool statusPublished=false;
+ for(const auto&message:a.client.messages)if(message.topic.find("/esp/state")!=std::string::npos)statusPublished=true;
+ assert(statusPublished);
+ std::vector<uint8_t> overflow(COMMBUFSIZE*2+1,0x5a);
+ i.serialBT.inject(overflow.data(),overflow.size());i.BTgetByte();assert(i.readTimeout);
+ i.disconnect();assert(i.connect(btAddress));
+ const uint8_t nextSessionByte=0x42;i.serialBT.inject(&nextSessionByte,1);
+ assert(i.BTgetByte()==nextSessionByte);assert(!i.readTimeout);
+ i.setServiceCallback(nullptr);a.appConfig=config;WiFi.state=wifiState;
+ a.client.onLoop=savedOnLoop;a.client.online=savedOnline;a.client.publishOK=savedPublishOK;
+ m.discoveryIdentityLoaded=savedDiscoveryLoaded;m.discoveryIdentity=savedDiscoveryIdentity;
+ m.lastEspStatusMillis=savedStatusTime;a.client.messages.clear();
+ WiFi.onStatus=savedWiFiStatus;
+ a.webServer.onResponseWrite=savedResponseWrite;
+}
+void testBluetoothInitializationRetries(){
+ auto&a=ESP32_SMA_Inverter_App::getInstance();
+ auto&i=ESP32_SMA_Inverter::getInstance();auto&b=i.serialBT;
+ const AppConfig savedConfig=a.appConfig;
+ const bool savedReady=a.bluetoothReady,savedAddressValid=a.bluetoothAddressValid;
+ const bool savedRetryScheduled=a.bluetoothInitRetryScheduled;
+ const uint32_t savedNextTime=a.nextTime,savedInitDeadline=a.nextBluetoothInitAttempt;
+ const uint32_t savedRetryMs=a.bluetoothInitRetryMs;
+ const int savedScanRate=a.lastAdjustedScanRate,savedWifiState=WiFi.state;
+ const bool savedNightTime=a.nightTime,savedClockRequest=a.clockSyncRequested;
+ const uint32_t savedClockDeadline=a.clockSyncRequestDeadline;
+ const String savedClockStatus=a.clockSyncStatus;
+ const bool savedValidTime=fake::validTime;
+ const int savedLocalHour=fake::localHourOverride;
+ const uint64_t savedTicks=fake::ticks;
+ const bool savedMqttOnline=a.client.online,savedSerialSavePending=a.serialSavePending;
+ const bool savedReadingPending=a.readingPending;
+ const uint32_t savedSerialSaveAttempt=a.nextSerialSaveAttempt;
+ const auto savedSerialInput=Serial.input;
+ const auto savedBeginResults=b.beginResults;
+ const bool savedBeginResult=b.beginResult,savedConnectResult=b.connectResult;
+ const auto savedDuringConnect=b.duringConnect;
+ const auto savedServiceCallback=i.serviceCallback;
+ const bool savedCallbackActive=i.btRxCallbackActive.load();
+ const bool savedDiscard=i.discardBtRx.load();
 
+ a.appConfig.mqttBroker="";a.appConfig.hassDisc=false;
+ a.bluetoothReady=false;a.bluetoothAddressValid=true;
+ a.bluetoothInitRetryScheduled=false;
+ a.bluetoothInitRetryMs=1000;a.nextBluetoothInitAttempt=0;
+ a.lastAdjustedScanRate=NIGHTSCANRATE;a.nextTime=0;
+ a.clockSyncRequested=false;a.serialSavePending=false;a.readingPending=false;
+ WiFi.state=WL_CONNECTED;a.client.online=true;
+ fake::validTime=false;fake::localHourOverride=-1;
+ b.beginResults.clear();b.beginResults.push_back(false);b.beginResults.push_back(true);
+ b.beginResult=true;b.connectResult=false;b.duringConnect=nullptr;
+ Serial.input.clear();
+ const unsigned beginCalls=b.beginCalls,connectCalls=b.connectCalls,unpairCalls=b.unpairCalls;
+ const unsigned endCalls=b.endCalls,loops=a.client.loops,accepts=fake::httpAcceptPolls;
 
+ // The failed attempt schedules its retry across millis() rollover and tears
+ // down the pinned core's partially initialized static Bluetooth resources.
+ const uint64_t wrap=uint64_t(UINT32_MAX)+1;
+ fake::ticks=wrap-500;
+ a.nextTime=millis();
+ a.initializeBluetoothIfDue();
+ assert(!a.bluetoothReady&&b.beginCalls==beginCalls+1);
+ assert(a.bluetoothInitRetryScheduled);
+ assert(b.endCalls==endCalls+1&&!i.btRxCallbackActive.load());
+ assert(i.serviceCallback==nullptr);
+ const uint32_t retryAt=a.nextBluetoothInitAttempt;
+ assert(retryAt<1000&&a.bluetoothInitRetryMs==2000);
 
+ // A poll remains queued, while unpair is refused, networking and serial
+ // handling keep running during the bounded retry backoff at night.
+ a.requestClockSync();
+ for(char c:std::string("unpair\npoll\n"))Serial.input.push_back(c);
+ fake::ticks=wrap+retryAt-500;
+ a.appLoop();
+ assert(!a.bluetoothReady&&b.beginCalls==beginCalls+1);
+ assert(b.connectCalls==connectCalls&&b.unpairCalls==unpairCalls);
+ assert(a.clockSyncRequested);
+ assert(a.client.loops>loops&&fake::httpAcceptPolls>accepts);
 
+ // Once the retry deadline passes, initialization succeeds and the queued
+ // poll is attempted immediately instead of waiting for the night interval.
+ fake::ticks=wrap+retryAt+10;
+ a.appLoop();
+ assert(a.bluetoothReady&&b.beginCalls==beginCalls+2);
+ assert(!a.bluetoothInitRetryScheduled);
+ assert(i.serviceCallback!=nullptr);
+ assert(b.connectCalls==connectCalls+1&&b.unpairCalls==unpairCalls);
+ assert(a.clockSyncRequested);
+
+ i.setServiceCallback(nullptr);
+ a.appConfig=savedConfig;a.bluetoothReady=savedReady;
+ a.bluetoothInitRetryScheduled=savedRetryScheduled;
+ a.bluetoothAddressValid=savedAddressValid;a.nextTime=savedNextTime;
+ a.nextBluetoothInitAttempt=savedInitDeadline;a.bluetoothInitRetryMs=savedRetryMs;
+ a.lastAdjustedScanRate=savedScanRate;a.nightTime=savedNightTime;
+ a.clockSyncRequested=savedClockRequest;a.clockSyncRequestDeadline=savedClockDeadline;
+ a.clockSyncStatus=savedClockStatus;WiFi.state=savedWifiState;
+ fake::validTime=savedValidTime;fake::localHourOverride=savedLocalHour;
+ fake::ticks=savedTicks;Serial.input=savedSerialInput;
+ a.client.online=savedMqttOnline;a.serialSavePending=savedSerialSavePending;
+ a.readingPending=savedReadingPending;a.nextSerialSaveAttempt=savedSerialSaveAttempt;
+ b.beginResults=savedBeginResults;b.beginResult=savedBeginResult;b.connectResult=savedConnectResult;
+ b.duringConnect=savedDuringConnect;i.setServiceCallback(savedServiceCallback);
+ i.btRxCallbackActive.store(savedCallbackActive);i.discardBtRx.store(savedDiscard);
+}
+void testSerialSaveRetry(){
+ auto&a=ESP32_SMA_Inverter_App::getInstance();auto&m=ESP32_SMA_MQTT::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();
+ auto config=a.appConfig;auto oldSerial=i.invData.Serial;a.appConfig.hassDisc=false;a.appConfig.mqttBroker="";
+ m.discoveryIdentityLoaded=true;m.discoveryIdentity="";a.appConfig.thisSerial=122;i.invData.Serial=123;
+ a.nextTime=millis()+100000;a.readingPending=false;a.serialSavePending=false;fake::writeLimit=0;a.appLoop();
+ assert(a.serialSavePending);assert(a.appConfig.thisSerial==123);fake::writeLimit=SIZE_MAX;fake::ticks+=30001;
+ a.appLoop();assert(!a.serialSavePending);StaticJsonDocument<2048> json;assert(!deserializeJson(json,fake::files["/config.txt"]));
+ assert(json["thisserial"]==123);a.appConfig=config;i.invData.Serial=oldSerial;assert(a.saveConfiguration());
+}
+void testPendingReadingRetry(){
+ auto&a=ESP32_SMA_Inverter_App::getInstance();auto&m=ESP32_SMA_MQTT::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();
+ auto config=a.appConfig;auto inv=i.invData;auto disp=i.dispData;
+ a.appConfig.mqttBroker="broker";a.appConfig.hassDisc=false;a.appConfig.scanRate=60;a.appConfig.thisSerial=42;i.invData.Serial=42;i.dispData.Pac=321;
+ m.discoveryIdentityLoaded=true;m.discoveryIdentity="";a.pendingReading=i.invData;a.pendingDisplay=i.dispData;
+ a.nightTime=false;a.pendingReadingMaxAgeMillis=300000;
+ fake::ticks=UINT32_MAX-3000ULL;a.pendingReadingAcquiredMillis=millis();
+ a.readingPending=true;a.nextPublishAttempt=millis();a.nextTime=millis()+100000;
+ WiFi.state=WL_CONNECTED;a.client.messages.clear();
+ a.client.publishOK=false;a.appLoop();assert(a.readingPending);
+ i.dispData.Pac=999;a.client.publishOK=true;fake::ticks+=5001;a.appLoop();assert(!a.readingPending);
+ const std::string stateTopic="SMA-42/state";unsigned statePublishes=0;
+ for(const auto&message:a.client.messages)if(message.topic==stateTopic){++statePublishes;StaticJsonDocument<2048> json;assert(!deserializeJson(json,message.payload));assert(json["Pac"]==321);}
+ assert(statePublishes==1);
+
+ // A retry at the normal nighttime cadence remains inside the same 45-minute
+ // expiry window used by nighttime discovery.
+ a.pendingReading=i.invData;a.pendingReading.Serial=42;a.pendingDisplay=i.dispData;a.pendingDisplay.Pac=654;
+ a.pendingReadingMaxAgeMillis=2700UL*1000UL;a.pendingReadingAcquiredMillis=millis();a.readingPending=true;
+ a.nextPublishAttempt=0;a.client.messages.clear();fake::ticks+=16UL*60UL*1000UL;a.nextTime=millis()+100000;
+ a.appLoop();assert(!a.readingPending);statePublishes=0;
+ for(const auto&message:a.client.messages)if(message.topic==stateTopic){++statePublishes;StaticJsonDocument<2048> json;assert(!deserializeJson(json,message.payload));assert(json["Pac"]==654);}
+ assert(statePublishes==1);
+
+ // Unsigned elapsed-time arithmetic must discard a sample whose expiry passes
+ // while millis() wraps, without publishing it after connectivity returns.
+ a.pendingReading=i.invData;a.pendingReading.Serial=42;a.pendingDisplay=i.dispData;a.pendingDisplay.Pac=777;
+ a.pendingReadingMaxAgeMillis=300000;a.readingPending=true;
+ fake::ticks=UINT32_MAX-1000ULL;a.pendingReadingAcquiredMillis=millis();a.nextPublishAttempt=millis();
+ a.client.messages.clear();fake::ticks+=300001UL;a.nextTime=millis()+100000;a.appLoop();
+ assert(!a.readingPending);statePublishes=0;
+ for(const auto&message:a.client.messages)if(message.topic==stateTopic)++statePublishes;
+ assert(statePublishes==0);
+ a.appConfig=config;i.invData=inv;i.dispData=disp;
+}
 void testDiscoveryIdentityCleanup(){
  auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();
  auto config=a.appConfig;auto serial=i.invData.Serial;fake::nvs.clear();
@@ -1488,7 +1718,38 @@ void testDiscoveryMigrationLongUptimeAndRollover(){
  m.discoveryIdentityLoaded=savedIdentityLoaded;m.discoveryIdentity=savedIdentity;
  m.discoveryMigrationAttempted=savedMigrationAttempted;m.lastDiscoveryMigrationAttemptMillis=savedLastAttempt;
 }
-
+void testBluetoothAddressValidation(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&w=a.webServer;
+ const AppConfig original=a.appConfig;const auto originalTicks=fake::ticks;
+ m.settingsToken="secret";
+ a.appConfig.mqttBroker="before";a.appConfig.smaBTAddress="01:23:45:67:89:AB";
+ assert(a.saveConfiguration());const auto committed=fake::files["/config.txt"];
+ const std::vector<std::string> malformed={
+  "AA:BB:CC:DD:EE:FZ", "AA:BB:CC:DD:EE:+F", "AA:BB:CC:DD:EE:-1",
+  "AA-BB-CC-DD-EE-FF", "AA:BB;CC:DD:EE:FF", "A:BB:CC:DD:EE:FF",
+  "AA:BB:CC:DD:EE", "AA:BB:CC:DD:EE:FF:"
+ };
+ for(const auto&value:malformed){
+  uint8_t decoded[6]={0xA5,0xA5,0xA5,0xA5,0xA5,0xA5};
+  assert(!parseSmaBluetoothAddress(value,decoded));
+  for(uint8_t octet:decoded)assert(octet==0xA5);
+  w.params={{"token","secret"},{"mqttBroker","must-not-save"},{"btaddress",value}};w.code=0;
+  m.handleForm();
+  assert(w.code==400);assert(a.appConfig.mqttBroker=="before");
+  assert(a.appConfig.smaBTAddress=="01:23:45:67:89:AB");
+  assert(fake::files["/config.txt"]==committed);
+ }
+ const String mixedCase="aA:bB:Cc:dD:eE:fF";
+ uint8_t decoded[6]={};assert(parseSmaBluetoothAddress(mixedCase,decoded));
+ const uint8_t expected[6]={0xAA,0xBB,0xCC,0xDD,0xEE,0xFF};
+ for(size_t i=0;i<6;++i)assert(decoded[i]==expected[i]);
+ w.params={{"token","secret"},{"mqttBroker","after"},{"btaddress",mixedCase}};w.code=0;
+ try{m.handleForm();assert(false);}catch(const fake::Restart&){}
+ assert(w.code==200);assert(a.appConfig.mqttBroker=="after");assert(a.appConfig.smaBTAddress==mixedCase);
+ StaticJsonDocument<2048> json;assert(!deserializeJson(json,fake::files["/config.txt"]));
+ assert(json["smaBTAddress"]==mixedCase.c_str());
+ a.appConfig=original;assert(a.saveConfiguration());fake::ticks=originalTicks;
+}
 
 int main(){
  testBoundedHttpRequests();
@@ -1522,7 +1783,11 @@ int main(){
  testSlowPacketDeadline();
  testCallerOperationDeadlinesAndRollover();
  testBluetoothTimerRollover();
+ testStaleRelayExpires();
+ testNightToDayShortensPollDeadline();
+ testFasterModePreservesEarlierDeadlineAcrossRollover();
  testLateWifiStartsNtp();
+ testMissingNtpDoesNotBlock();
  testExcessFormArguments();
  testSettingsToken();
  testNtpInput();
@@ -1544,10 +1809,15 @@ int main(){
  testClockExpiresDuringRead();
  testConnectRetainsEarlyHandshakeAndCleansFailedSession();
  testBluetoothAuthRecoveryMatchesTargetPeer();
+ testServicesRunDuringReceive();
+ testSerialSaveRetry();
+ testPendingReadingRetry();
  testDiscoveryIdentityCleanup();
  testDiscoveryMigrationLongUptimeAndRollover();
  testNumericSettingsValidation();
  testTimezoneConfigurationReload();
+ testBluetoothAddressValidation();
+ testBluetoothInitializationRetries();
  testWebBasicAuthentication();
  InverterData identity{}; identity.SUSyID=0x1234; assert(identity.SUSyID==0x1234);
  uint8_t bytes[]={0x78,0x56,0x34,0x12,0,0,0,0};
