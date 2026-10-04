@@ -968,7 +968,7 @@ void testDiscoveryCapacity(){
  size_t diagnostics=0;for(auto&message:a.client.messages){if(message.payload.empty())continue;
   StaticJsonDocument<2048> json;assert(!deserializeJson(json,message.payload));if(json["entity_category"]=="diagnostic")++diagnostics;
  }
- assert(diagnostics==4);
+ assert(diagnostics==11); // four device sensors plus seven poll/MQTT health sensors
  char tiny[20];m.discoveryPublishOK=true;auto count=a.client.messages.size();
  m.sendHassAutoNoClassNoUnit(tiny,sizeof(tiny),2700,"SMA-1","Status","DevStatus","DevStatus");
  assert(!m.discoveryPublishOK);assert(a.client.messages.size()==count);i.invData.Serial=0;
@@ -1076,7 +1076,10 @@ void testProvisioningTimeouts(){
 void testDiscoveryAfterReconnectAndBirth(){
  auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();
  a.appConfig.mqttBroker="broker";a.appConfig.mqttTopic="SMA";a.appConfig.hassDisc=true;a.appConfig.thisSerial=55;i.invData.Serial=55;
- m.wifiStartup();a.firstTime=false;a.client.online=false;assert(m.brokerConnect());assert(a.firstTime);
+ m.wifiStartup();a.firstTime=false;a.client.online=false;assert(m.brokerConnect());
+ // Retained discovery survives a reconnect; only a birth message or a new
+ // identity re-announces it.
+ assert(!a.firstTime);a.requestDiscovery();
  a.nextTime=millis()+100000;a.client.messages.clear();a.appLoop();assert(!a.firstTime);
  size_t configs=0;for(auto&msg:a.client.messages)if(msg.topic.find("homeassistant/sensor/SMA-55/")==0&&!msg.payload.empty()){
   StaticJsonDocument<2048> json;assert(!deserializeJson(json,msg.payload));if(json["entity_category"].isNull())++configs;
@@ -1751,6 +1754,108 @@ void testBluetoothAddressValidation(){
  a.appConfig=original;assert(a.saveConfiguration());fake::ticks=originalTicks;
 }
 
+
+void testReannouncementDoesNotHoldReadings(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();
+ auto config=a.appConfig;auto inv=i.invData;auto disp=i.dispData;
+ a.appConfig.mqttBroker="broker";a.appConfig.mqttTopic="SMA";a.appConfig.hassDisc=true;a.appConfig.thisSerial=77;i.invData.Serial=77;
+ m.discoveryIdentityLoaded=true;m.discoveryIdentity="SMA-77";WiFi.state=WL_CONNECTED;a.client.online=true;a.client.publishOK=true;
+ a.discoveredSerial=77;a.firstTime=true;a.nextDiscoveryAttempt=millis()+60000;a.dayNight=a.nightTime;
+ a.pendingReading=i.invData;a.pendingDisplay=i.dispData;a.pendingDisplay.Pac=432;
+ a.pendingReadingAcquiredMillis=millis();a.pendingReadingMaxAgeMillis=300000;a.readingPending=true;a.nextPublishAttempt=millis();
+ a.nextTime=millis()+100000;a.client.messages.clear();
+ a.appLoop();
+ // The pending re-announcement is throttled, but the reading still goes out.
+ assert(a.firstTime);assert(!a.readingPending);
+ bool published=false;for(auto&msg:a.client.messages)if(msg.topic=="sma/solar/SMA-77/state")published=true;
+ assert(published);
+ // A reading for an inverter never announced still waits for discovery.
+ a.discoveredSerial=0;a.pendingReadingAcquiredMillis=millis();a.readingPending=true;a.nextPublishAttempt=millis();
+ a.nextDiscoveryAttempt=millis()+60000;a.client.messages.clear();a.appLoop();
+ assert(a.readingPending);
+ a.readingPending=false;a.firstTime=false;a.discoveredSerial=0;a.appConfig=config;i.invData=inv;i.dispData=disp;a.client.messages.clear();
+}
+void testConfigurableTimeoutsAndPollBudget(){
+ auto&i=ESP32_SMA_Inverter::getInstance();auto&b=i.serialBT;
+ const uint32_t savedReply=i.replyTimeoutMs;
+ b.input.clear();b.onAvailable=nullptr;fake::ticks=7000000;
+ i.replyTimeoutMs=5000;uint64_t start=fake::ticks;
+ i.BTgetByte();assert(i.readTimeout);assert(fake::ticks-start>=5000&&fake::ticks-start<6000);
+ assert(i.replyTimeoutCount()>=1);
+ // The poll budget cuts a wait short even when the reply window is longer.
+ i.replyTimeoutMs=20000;i.beginPollBudget(3000);assert(i.replyTimeoutCount()==0);
+ start=fake::ticks;i.BTgetByte();assert(i.readTimeout);
+ assert(fake::ticks-start>=3000&&fake::ticks-start<4000);assert(i.pollBudgetWasExhausted());
+ // Once exhausted, every later wait in the same poll returns immediately.
+ start=fake::ticks;i.BTgetByte();assert(i.readTimeout);assert(fake::ticks-start<50);
+ i.endPollBudget();start=fake::ticks;i.replyTimeoutMs=1000;i.BTgetByte();assert(fake::ticks-start>=1000);
+ i.replyTimeoutMs=savedReply;
+}
+static bool dueWithin(uint32_t deadline,int32_t expected){
+ // The host millis() fake advances on every call, so allow a few ticks.
+ const int32_t remaining=(int32_t)(deadline-millis());return remaining<=expected&&remaining>expected-20;
+}
+void testPollResultScheduling(){
+ auto&a=ESP32_SMA_Inverter_App::getInstance();
+ const auto savedStats=a.stats;const auto savedNext=a.nextTime;const auto savedRate=a.lastAdjustedScanRate;
+ const bool savedClock=a.clockSyncRequested;const auto savedGen=a.clockSyncGeneration;const String savedStatus=a.clockSyncStatus;
+ const bool savedPending=a.readingPending,savedRead=a.hasSuccessfulRead;const auto savedFail=a.failCount;
+ fake::ticks=8000000;a.lastAdjustedScanRate=60000;a.stats=PollStats();
+
+ // Scheduling counts from the end of a poll, however long it took.
+ a.activeJob=PollJob();a.activeJob.nightTime=true;a.activeJob.intervalMs=NIGHTSCANRATE;
+ a.pollResult=PollResult();a.pollResult.connected=true;a.pollResult.readOk=false;a.pollResult.durationMs=75000;
+ a.pollResult.replyTimeouts=3;a.pollResult.finishedMillis=millis();
+ a.pollState.store(ESP32_SMA_Inverter_App::POLL_DONE);a.processPollResult();
+ assert(!a.isPolling());assert(dueWithin(a.nextTime,60000));
+ assert(a.stats.polls==1&&a.stats.failures==1&&a.stats.lastDurationMs==75000&&a.stats.maxDurationMs==75000);
+ assert(a.stats.lastReplyTimeouts==3);assert(std::string(a.stats.lastOutcome)=="reply timeout");
+
+ // A poll request made while busy runs as soon as the poll ends.
+ a.pollState.store(ESP32_SMA_Inverter_App::POLL_RUNNING);a.requestPollNow();assert(a.pollRequestedWhileBusy);
+ a.pollResult=PollResult();a.pollResult.connected=true;a.pollResult.readOk=true;a.pollResult.durationMs=4000;
+ a.pollResult.reading.Serial=91;a.pollResult.finishedMillis=millis();
+ a.pollState.store(ESP32_SMA_Inverter_App::POLL_DONE);a.processPollResult();
+ assert(dueWithin(a.nextTime,0));assert(!a.pollRequestedWhileBusy);assert(a.readingPending&&a.pendingReading.Serial==91);
+ assert(std::string(a.stats.lastOutcome)=="ok"&&a.stats.maxDurationMs==75000);
+
+ // A clock press made during the poll stays queued; the attempted one reports.
+ a.clockSyncRequested=true;a.activeJob.clockSyncGeneration=a.clockSyncGeneration;++a.clockSyncGeneration;
+ a.pollResult=PollResult();a.pollResult.connected=true;a.pollResult.clockSyncAttempted=true;
+ a.pollResult.clockSyncStatus="Verified: test";a.pollResult.finishedMillis=millis();
+ a.pollState.store(ESP32_SMA_Inverter_App::POLL_DONE);a.processPollResult();
+ assert(a.clockSyncRequested);assert(a.clockSyncStatus=="Verified: test");
+ a.activeJob.clockSyncGeneration=a.clockSyncGeneration;
+ a.pollState.store(ESP32_SMA_Inverter_App::POLL_DONE);a.processPollResult();assert(!a.clockSyncRequested);
+
+ // Authentication recovery retries after a second, not a full interval.
+ a.pollResult=PollResult();a.pollResult.reconnectRequested=true;a.activeJob.nightTime=true;
+ a.pollState.store(ESP32_SMA_Inverter_App::POLL_DONE);a.processPollResult();assert(dueWithin(a.nextTime,1000));
+ assert(std::string(a.stats.lastOutcome)=="no connection");
+
+ a.stats=savedStats;a.nextTime=savedNext;a.lastAdjustedScanRate=savedRate;a.clockSyncRequested=savedClock;
+ a.clockSyncGeneration=savedGen;a.clockSyncStatus=savedStatus;a.readingPending=savedPending;a.hasSuccessfulRead=savedRead;a.failCount=savedFail;
+}
+void testEspStatusReportsPollHealth(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();
+ auto config=a.appConfig;const auto savedStats=a.stats;const bool savedLoaded=m.discoveryIdentityLoaded;const String savedIdentity=m.discoveryIdentity;
+ a.appConfig.mqttBroker="broker";a.appConfig.hassDisc=true;a.appConfig.mqttTopic="SMA";a.appConfig.thisSerial=88;
+ m.discoveryIdentityLoaded=true;m.discoveryIdentity="SMA-88";WiFi.state=WL_CONNECTED;a.client.online=false;a.client.publishOK=true;
+ a.stats.polls=12;a.stats.failures=2;a.stats.lastDurationMs=4321;a.stats.maxDurationMs=91000;a.stats.lastReplyTimeouts=1;a.stats.lastOutcome="ok";
+ m.espDiscoveryPublished=false;m.lastEspStatusMillis=0;a.client.messages.clear();const uint32_t connects=m.mqttConnects;
+ assert(m.publishEspStatus(true));assert(m.mqttConnects==connects+1);
+ bool sawState=false;unsigned diagnosticConfigs=0;
+ for(auto&msg:a.client.messages){
+  if(msg.topic.find("/esp/state")!=std::string::npos){
+   sawState=true;StaticJsonDocument<1024> json;assert(msg.payload.size()<512);assert(!deserializeJson(json,msg.payload));
+   assert(json["LastPollMs"]==4321&&json["MaxPollMs"]==91000&&json["PollFailures"]==2&&json["Polls"]==12);
+   assert(json["LastPollResult"]=="ok"&&json["MqttConnects"]==connects+1&&json["ResetReason"]=="host");
+  }
+  if(msg.topic.find("homeassistant/sensor/SMA-88/esp_")==0&&!msg.payload.empty())++diagnosticConfigs;
+ }
+ assert(sawState);assert(diagnosticConfigs==11);
+ a.appConfig=config;a.stats=savedStats;m.discoveryIdentityLoaded=savedLoaded;m.discoveryIdentity=savedIdentity;a.client.messages.clear();
+}
 int main(){
  testBoundedHttpRequests();
  testBoundedHttpFormCompatibility();
@@ -1819,6 +1924,10 @@ int main(){
  testBluetoothAddressValidation();
  testBluetoothInitializationRetries();
  testWebBasicAuthentication();
+ testReannouncementDoesNotHoldReadings();
+ testConfigurableTimeoutsAndPollBudget();
+ testPollResultScheduling();
+ testEspStatusReportsPollHealth();
  InverterData identity{}; identity.SUSyID=0x1234; assert(identity.SUSyID==0x1234);
  uint8_t bytes[]={0x78,0x56,0x34,0x12,0,0,0,0};
  assert(get_u16(bytes)==0x5678);

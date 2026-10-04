@@ -77,6 +77,7 @@ private:
     bool espDiscoveryPublished = false;
     uint32_t espDiscoveredSerial = 0;
     unsigned long lastEspStatusMillis = 0;
+    uint32_t mqttConnects = 0;
     String clockSyncToken;
     String smartConfigToken;
     String settingsToken;

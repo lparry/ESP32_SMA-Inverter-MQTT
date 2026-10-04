@@ -156,6 +156,7 @@ void ESP32_SMA_Inverter_App::appSetup() {
                 invData.BTAddress[5], invData.BTAddress[4], invData.BTAddress[3],
                 invData.BTAddress[2], invData.BTAddress[1], invData.BTAddress[0]);
     // *** Start BT
+    startPollWorker();
     initializeBluetoothIfDue(); // "true" creates this device as a BT Master.
     logW("USB commands: unpair (remove inverter bond and retry), poll (read now)");
   }
@@ -169,22 +170,27 @@ void loop() {
 }
 
 void ESP32_SMA_Inverter_App::appLoop() { 
+  // MQTT, Wi-Fi and HTTP are serviced here on every pass. With the poll task
+  // running, Bluetooth waits happen on that task instead of this loop.
   mqttInstanceForApp.wifiLoop();
   handleSerialCommands();
   initializeBluetoothIfDue();
+  processPollResult();
   int adjustedScanRate;
   struct tm timeinfo;
-  InverterData& invData = ESP32_SMA_Inverter::getInstance().invData;
-  DisplayData& dispData = ESP32_SMA_Inverter::getInstance().dispData;
   bool ntpWorking = getLocalTime(&timeinfo, 0);
+  const bool pollIdle = !isPolling();
 
   if (clockSyncRequested && (int32_t)(millis() - clockSyncRequestDeadline) >= 0) {
     clockSyncRequested = false;
     clockSyncStatus = "Request expired before an inverter connection was available";
   }
 
+  // invData belongs to the poll task while a poll is running. Use the last
+  // relay state observed while idle until the poll hands the data back.
+  if (pollIdle) lastRelayClosed = ESP32_SMA_Inverter::invData.GridRelay == 51;
   const uint32_t relayFreshnessMs = max(120, constrain(appConfig.scanRate, 10, 3600) * 2) * 1000UL;
-  const bool freshClosedRelay = hasSuccessfulRead && invData.GridRelay == 51 &&
+  const bool freshClosedRelay = hasSuccessfulRead && lastRelayClosed &&
       (uint32_t)(millis() - lastSuccessfulReadMillis) < relayFreshnessMs;
 // Check if the Sun is up or a recent reading reports the grid relay closed
   if ((ntpWorking && (timeinfo.tm_hour >= SUNUP) && (timeinfo.tm_hour < SUNDOWN)) || freshClosedRelay){
@@ -199,103 +205,33 @@ void ESP32_SMA_Inverter_App::appLoop() {
     if ((int32_t)(nextTime - fasterDeadline) > 0) nextTime = fasterDeadline;
   }
   lastAdjustedScanRate = adjustedScanRate;
-  // connect or reconnect after connection lost 
-  if (!smartConfig && bluetoothReady && bluetoothAddressValid &&
+  // Start a poll when one is due and the previous one has been consumed.
+  if (!smartConfig && bluetoothReady && bluetoothAddressValid && pollIdle &&
       ((int32_t)(millis() - nextTime) >= 0) && (!smaInverter.isBtConnected())) {
-    pollingInProgress = true;
-    struct PollGuard { bool& active; ~PollGuard() { active = false; } } pollGuard{pollingInProgress};
     nextTime = millis() + adjustedScanRate;
     if(nightTime)
       logW("Night time - 15min scans\n");
-    smaInverter.setPcktID(1);//pcktID = 1;
-    
-    // **** Connect SMA **********
-    logW("Connecting SMA inverter: \n");
-    if (smaInverter.connect(smaBTAddress)) {
-      //btConnected = true;
-      
-      // **** Initialize SMA *******
-      logW("BT connected \n");
-      E_RC rc = smaInverter.initialiseSMAConnection();
-      logI("SMA %d \n",rc);
-      if (rc == E_OK) {
-        smaInverter.getBT_SignalStrength();
-      }
-
-#ifdef LOGOFF
-      // not sure the purpose but SBfSpot code logs off before logging on and this has proved very reliable for me: mrtoy-me 
-      smaInverter.logoffSMAInverter();
-#endif
-      // **** logon SMA ************
-      logW("*** logonSMAInverter\n");
-      if (rc == E_OK) {
-        rc = smaInverter.logonSMAInverter(smaInvPass, USERGROUP);
-        logI("Logon return code %d\n",rc);
-      }
-      if (rc == E_OK && clockSyncRequested) {
-        // Clear before attempting: every button press permits exactly one write attempt.
-        clockSyncRequested = false;
-        const uint32_t requestDeadline = clockSyncRequestDeadline;
-        int32_t beforeTime = 0;
-        int32_t afterTime = 0;
-        int32_t utcOffsetSeconds = (int32_t)lroundf(appConfig.timezone * 3600.0f);
-        E_RC clockRc = smaInverter.syncPlantTime(utcOffsetSeconds, &beforeTime, &afterTime, &requestDeadline);
-        if (clockRc == E_OK) {
-          clockSyncStatus = "Verified: " + formatLocalEpoch(beforeTime) + " -> " + formatLocalEpoch(afterTime);
-        } else if (clockRc == E_EXPIRED) {
-          clockSyncStatus = "Request expired before the clock write; inverter clock unchanged";
-        } else {
-          clockSyncStatus = "Clock sync failed with code " + String((int)clockRc) + "; no automatic retry";
-          logW("Clock sync failed (%d)", clockRc);
-        }
-      }
-      if (rc == E_OK) {
-        InverterData previousInvData = invData;
-        DisplayData previousDispData = dispData;
-        rc = smaInverter.ReadCurrentData();
-        if (rc == E_OK) {
-          pendingReading = invData;
-          pendingDisplay = dispData;
-          pendingReadingAcquiredMillis = millis();
-          pendingReadingMaxAgeMillis = measurementExpirySeconds(nightTime, appConfig.scanRate) * 1000UL;
-          readingPending = true;
-          nextPublishAttempt = millis();
-          hasSuccessfulRead = true;
-          lastSuccessfulReadMillis = millis();
-        } else {
-          invData = previousInvData;
-          dispData = previousDispData;
-          logW("Discarding incomplete inverter read (%d)", rc);
-        }
-      } else {
-        logW("Skipping inverter read after setup/login failure (%d)", rc);
-      }
-#ifdef LOGOFF    
-      //logoff before disconnecting
-      smaInverter.logoffSMAInverter();
-#endif
-      
-      smaInverter.disconnect(); //moved btConnected to inverter class
-//       mqttInstanceForApp.publishData();
-      failCount=0;
-    } else { 
-      if (smaInverter.takeReconnectRequest()) nextTime = millis() + 1000UL;
-      // Inverter shuts down at night so no bluetooth. Don't bother rebooting, just keep trying 
-      if (!nightTime) {
-        mqttInstanceForApp.logViaMQTT("Bluetooth failed to connect");
-        failCount++;
-        if( failCount > 5 ) {
-          logW("Failed to connect 5 times: Reboot\n");
-          ESP.restart();
-        }
-      }
-    } 
+    PollJob job;
+    job.nightTime = nightTime;
+    job.intervalMs = (uint32_t)adjustedScanRate;
+    job.unpairFirst = unpairRequested;
+    unpairRequested = false;
+    job.clockSync = clockSyncRequested;
+    job.clockSyncDeadline = clockSyncRequestDeadline;
+    job.clockSyncGeneration = clockSyncGeneration;
+    job.utcOffsetSeconds = (int32_t)lroundf(appConfig.timezone * 3600.0f);
+    dispatchPoll(job);
+    // Host builds and the no-task fallback finish the poll synchronously.
+    processPollResult();
   }
   
-  if (invData.Serial != 0 && appConfig.thisSerial != invData.Serial) {
-    appConfig.thisSerial = invData.Serial;
-    serialSavePending = true;
-    nextSerialSaveAttempt = millis();
+  if (!isPolling()) {
+    const uint32_t polledSerial = ESP32_SMA_Inverter::invData.Serial;
+    if (polledSerial != 0 && appConfig.thisSerial != polledSerial) {
+      appConfig.thisSerial = polledSerial;
+      serialSavePending = true;
+      nextSerialSaveAttempt = millis();
+    }
   }
   if (serialSavePending && (int32_t)(millis() - nextSerialSaveAttempt) >= 0) {
     nextSerialSaveAttempt = millis() + 30000UL;
@@ -304,7 +240,8 @@ void ESP32_SMA_Inverter_App::appLoop() {
   }
   // Discovery carries the sensor expiry. Update it when the polling mode changes,
   // even if the inverter has gone to sleep and no new reading can be published.
-  const uint32_t currentSerial = invData.Serial != 0 ? invData.Serial : appConfig.thisSerial;
+  const uint32_t currentSerial = appConfig.thisSerial != 0 ? appConfig.thisSerial
+      : (hasSuccessfulRead ? pendingReading.Serial : 0);
   if (appConfig.hassDisc && appConfig.mqttBroker.length() > 0 &&
       currentSerial != 0 &&
       (firstTime || nightTime != dayNight || currentSerial != discoveredSerial) &&
@@ -320,8 +257,10 @@ void ESP32_SMA_Inverter_App::appLoop() {
     }
   }
   // Retry the most recent complete reading until it is published or superseded.
+  // Discovery is retained by the broker, so once this inverter's entities have
+  // been announced a later re-announcement must not hold readings back.
   const bool discoveryReady = !appConfig.hassDisc ||
-      (!firstTime && discoveredSerial == pendingReading.Serial);
+      (discoveredSerial != 0 && discoveredSerial == pendingReading.Serial);
   if (readingPending &&
       (uint32_t)(millis() - pendingReadingAcquiredMillis) >= pendingReadingMaxAgeMillis) {
     readingPending = false;
@@ -336,7 +275,208 @@ void ESP32_SMA_Inverter_App::appLoop() {
   mqttInstanceForApp.wifiLoop();
 
     
-  delay(100);
+  delay(pollTaskAvailable ? 20 : 100);
+}
+
+void ESP32_SMA_Inverter_App::requestPollNow() {
+  // A request made while a poll runs is honoured as soon as that poll ends,
+  // instead of being overwritten by the end-of-poll schedule.
+  if (isPolling()) pollRequestedWhileBusy = true;
+  nextTime = millis();
+}
+
+#if defined(ARDUINO_ARCH_ESP32)
+static TaskHandle_t pollTaskHandle = nullptr;
+#endif
+
+void ESP32_SMA_Inverter_App::pollTaskEntry(void *arg) {
+#if defined(ARDUINO_ARCH_ESP32)
+  ESP32_SMA_Inverter_App *app = static_cast<ESP32_SMA_Inverter_App*>(arg);
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    if (app->pollState.load(std::memory_order_acquire) == POLL_RUNNING) app->runPollJob();
+  }
+#else
+  (void)arg;
+#endif
+}
+
+void ESP32_SMA_Inverter_App::startPollWorker() {
+#if defined(ARDUINO_ARCH_ESP32)
+  if (pollTaskAvailable) return;
+  // Same stack size as the Arduino loop task the poll previously ran on.
+  if (xTaskCreatePinnedToCore(pollTaskEntry, "sma-poll", SMA_POLL_TASK_STACK, this, 1,
+                              &pollTaskHandle, ARDUINO_RUNNING_CORE) == pdPASS) {
+    pollTaskAvailable = true;
+    logI("Inverter poll task started");
+  } else {
+    pollTaskHandle = nullptr;
+    logE("Could not start the inverter poll task; polling inline");
+  }
+#endif
+}
+
+void ESP32_SMA_Inverter_App::dispatchPoll(const PollJob& job) {
+  if (pollState.load(std::memory_order_acquire) != POLL_IDLE) return;
+  activeJob = job;
+  pollResult = PollResult();
+  pollState.store(POLL_RUNNING, std::memory_order_release);
+#if defined(ARDUINO_ARCH_ESP32)
+  if (pollTaskAvailable) {
+    xTaskNotifyGive(pollTaskHandle);
+    return;
+  }
+#endif
+  runPollJob();
+}
+
+// Runs on the poll task. It may touch smaInverter, invData/dispData,
+// activeJob and pollResult only; everything else belongs to the main loop.
+void ESP32_SMA_Inverter_App::runPollJob() {
+  const PollJob& job = activeJob;
+  PollResult& result = pollResult;
+  InverterData& invData = ESP32_SMA_Inverter::getInstance().invData;
+  DisplayData& dispData = ESP32_SMA_Inverter::getInstance().dispData;
+  const uint32_t started = millis();
+  smaInverter.beginPollBudget(SMA_POLL_BUDGET_MS);
+  E_RC rc = E_NODATA;
+
+  if (job.unpairFirst) {
+    logW("Removing configured inverter bond before connecting");
+    result.unpairOk = smaInverter.unpair(smaBTAddress);
+  }
+  smaInverter.setPcktID(1);//pcktID = 1;
+
+  // **** Connect SMA **********
+  logW("Connecting SMA inverter: \n");
+  if (smaInverter.connect(smaBTAddress)) {
+    result.connected = true;
+
+    // **** Initialize SMA *******
+    logW("BT connected \n");
+    rc = smaInverter.initialiseSMAConnection();
+    logI("SMA %d \n",rc);
+    if (rc == E_OK) {
+      smaInverter.getBT_SignalStrength();
+    }
+
+#ifdef LOGOFF
+    // not sure the purpose but SBfSpot code logs off before logging on and this has proved very reliable for me: mrtoy-me
+    smaInverter.logoffSMAInverter();
+#endif
+    // **** logon SMA ************
+    logW("*** logonSMAInverter\n");
+    if (rc == E_OK) {
+      rc = smaInverter.logonSMAInverter(smaInvPass, USERGROUP);
+      logI("Logon return code %d\n",rc);
+    }
+    if (rc == E_OK && job.clockSync) {
+      // Every button press permits exactly one write attempt.
+      result.clockSyncAttempted = true;
+      int32_t beforeTime = 0;
+      int32_t afterTime = 0;
+      E_RC clockRc = smaInverter.syncPlantTime(job.utcOffsetSeconds, &beforeTime, &afterTime,
+                                               &job.clockSyncDeadline);
+      if (clockRc == E_OK) {
+        result.clockSyncStatus = "Verified: " + formatLocalEpoch(beforeTime) + " -> " + formatLocalEpoch(afterTime);
+      } else if (clockRc == E_EXPIRED) {
+        result.clockSyncStatus = "Request expired before the clock write; inverter clock unchanged";
+      } else {
+        result.clockSyncStatus = "Clock sync failed with code " + String((int)clockRc) + "; no automatic retry";
+        logW("Clock sync failed (%d)", clockRc);
+      }
+    }
+    if (rc == E_OK) {
+      pollRollback = invData;
+      pollDisplayRollback = dispData;
+      rc = smaInverter.ReadCurrentData();
+      if (rc == E_OK) {
+        result.readOk = true;
+        result.reading = invData;
+        result.display = dispData;
+      } else {
+        invData = pollRollback;
+        dispData = pollDisplayRollback;
+        logW("Discarding incomplete inverter read (%d)", rc);
+      }
+    } else {
+      logW("Skipping inverter read after setup/login failure (%d)", rc);
+    }
+#ifdef LOGOFF
+    //logoff before disconnecting
+    smaInverter.logoffSMAInverter();
+#endif
+
+    smaInverter.disconnect(); //moved btConnected to inverter class
+  } else {
+    result.reconnectRequested = smaInverter.takeReconnectRequest();
+  }
+  result.rc = rc;
+  result.budgetExhausted = smaInverter.pollBudgetWasExhausted();
+  result.replyTimeouts = smaInverter.replyTimeoutCount();
+  smaInverter.endPollBudget();
+  if (!result.readOk) result.display = dispData;
+  result.finishedMillis = millis();
+  result.durationMs = result.finishedMillis - started;
+  logI("Inverter poll finished in %lu ms (%u reply timeouts)",
+       static_cast<unsigned long>(result.durationMs), static_cast<unsigned>(result.replyTimeouts));
+  pollState.store(POLL_DONE, std::memory_order_release);
+}
+
+// Main loop: consume a finished poll and schedule the next one from its end,
+// so the inverter and radio get a full scan interval of rest between polls.
+void ESP32_SMA_Inverter_App::processPollResult() {
+  if (pollState.load(std::memory_order_acquire) != POLL_DONE) return;
+  const PollJob& job = activeJob;
+  const PollResult& result = pollResult;
+
+  ++stats.polls;
+  stats.lastDurationMs = result.durationMs;
+  if (result.durationMs > stats.maxDurationMs) stats.maxDurationMs = result.durationMs;
+  stats.lastReplyTimeouts = result.replyTimeouts;
+  if (!result.connected) stats.lastOutcome = "no connection";
+  else if (result.readOk) stats.lastOutcome = "ok";
+  else if (result.budgetExhausted) stats.lastOutcome = "poll budget exhausted";
+  else if (result.replyTimeouts) stats.lastOutcome = "reply timeout";
+  else stats.lastOutcome = "read failed";
+  if (!result.readOk) ++stats.failures;
+  lastAttemptDisplay = result.display;
+
+  if (result.clockSyncAttempted) {
+    clockSyncStatus = result.clockSyncStatus;
+    // A newer press made during the poll stays queued for the next poll.
+    if (job.clockSyncGeneration == clockSyncGeneration) clockSyncRequested = false;
+  }
+
+  if (result.connected) {
+    if (result.readOk) {
+      pendingReading = result.reading;
+      pendingDisplay = result.display;
+      pendingReadingAcquiredMillis = result.finishedMillis;
+      pendingReadingMaxAgeMillis = measurementExpirySeconds(job.nightTime, appConfig.scanRate) * 1000UL;
+      readingPending = true;
+      nextPublishAttempt = millis();
+      hasSuccessfulRead = true;
+      lastSuccessfulReadMillis = result.finishedMillis;
+    }
+    failCount=0;
+  } else if (!job.nightTime) {
+    // Inverter shuts down at night so no bluetooth. Don't bother rebooting, just keep trying
+    mqttInstanceForApp.logViaMQTT("Bluetooth failed to connect");
+    failCount++;
+    if( failCount > 5 ) {
+      logW("Failed to connect 5 times: Reboot\n");
+      mqttInstanceForApp.logViaMQTT("Rebooting after 5 failed Bluetooth connections");
+      ESP.restart();
+    }
+  }
+
+  const uint32_t interval = lastAdjustedScanRate > 0 ? (uint32_t)lastAdjustedScanRate : job.intervalMs;
+  if (result.reconnectRequested) nextTime = millis() + 1000UL;
+  else if (pollRequestedWhileBusy) nextTime = millis();
+  else nextTime = millis() + interval;
+  pollRequestedWhileBusy = false;
+  pollState.store(POLL_IDLE, std::memory_order_release);
 }
 
 void ESP32_SMA_Inverter_App::handleSerialCommands() {
@@ -350,14 +490,15 @@ void ESP32_SMA_Inverter_App::handleSerialCommands() {
           if (!bluetoothAddressValid) logE("Cannot unpair: inverter Bluetooth address is invalid");
           else if (!bluetoothReady) logE("Cannot unpair: Bluetooth is still initializing");
           else {
-            logW("USB unpair command: removing configured inverter bond");
-            if (smaInverter.unpair(smaBTAddress)) nextTime = millis() + 250UL;
+            logW("USB unpair command: removing configured inverter bond before the next poll");
+            unpairRequested = true;
+            requestPollNow();
           }
         } else if (strcmp(serialCommand, "poll") == 0) {
           if (bluetoothAddressValid) {
             logW("%s", bluetoothReady ? "USB poll command: requesting inverter read"
                                       : "USB poll command: queued until Bluetooth initializes");
-            nextTime = millis();
+            requestPollNow();
           } else logE("Cannot poll: inverter Bluetooth address is invalid");
         } else if (strcmp(serialCommand, "format-config") == 0) {
           logW("USB format-config command: erasing the settings filesystem");
@@ -399,7 +540,10 @@ void ESP32_SMA_Inverter_App::initializeBluetoothIfDue() {
   bluetoothReady = true;
   bluetoothInitRetryScheduled = false;
   bluetoothInitRetryMs = 1000UL;
-  smaInverter.setServiceCallback([]() { mqttInstanceForApp.wifiLoop(true); });
+  // Inline polling (host builds, or no poll task) must keep the network
+  // serviced from inside Bluetooth waits. The poll task needs no callback:
+  // the main loop keeps running beside it.
+  if (!pollTaskAvailable) smaInverter.setServiceCallback([]() { mqttInstanceForApp.wifiLoop(true); });
   logI("Bluetooth initialized");
 }
 
@@ -411,8 +555,9 @@ void ESP32_SMA_Inverter_App::requestClockSync() {
     return;
   }
   clockSyncRequested = true;
+  ++clockSyncGeneration;
   clockSyncRequestDeadline = millis() + 5UL * 60UL * 1000UL;
-  nextTime = millis();
+  requestPollNow();
   clockSyncStatus = "Queued for the next inverter connection; expires in five minutes";
 }
 

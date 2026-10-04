@@ -34,6 +34,7 @@ SOFTWARE.
 #include <cmath>
 
 #include "ESP32Loggable.h"
+#include "ConfigDefaults.h"
 
 #define tokWh(value64)    (double)(value64)/1000
 #define tokW(value32)     (float)(value32)/1000
@@ -276,6 +277,15 @@ class ESP32_SMA_Inverter : public ESP32Loggable {
     bool takeReconnectRequest();
     void setServiceCallback(void (*callback)()) { serviceCallback = callback; }
 
+    // Every Bluetooth wait stops at the reply/query deadline. A poll budget
+    // additionally bounds the whole connect-to-disconnect transaction.
+    void beginPollBudget(uint32_t budgetMs);
+    void endPollBudget();
+    bool pollBudgetWasExhausted() const { return pollBudgetExpired; }
+    uint16_t replyTimeoutCount() const { return replyTimeouts; }
+    uint32_t replyTimeoutMs = SMA_REPLY_TIMEOUT_MS;
+    uint32_t queryTimeoutMs = SMA_QUERY_TIMEOUT_MS;
+
 
     //Prototypes
     uint8_t BTgetByte(const uint32_t *callerDeadline = nullptr);
@@ -362,6 +372,10 @@ class ESP32_SMA_Inverter : public ESP32Loggable {
         bool readTimeout = false;
         bool receivingPacket = false;
         uint32_t receiveStarted = 0;
+        bool pollBudgetActive = false;
+        bool pollBudgetExpired = false;
+        uint32_t pollBudgetDeadline = 0;
+        uint16_t replyTimeouts = 0;
         void (*serviceCallback)() = nullptr;
         uint32_t lastServiceMillis = 0;
         bool servicing = false;

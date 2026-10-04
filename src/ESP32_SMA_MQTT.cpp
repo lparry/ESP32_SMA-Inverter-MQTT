@@ -25,6 +25,9 @@ SOFTWARE.
 #include "ESP32_SMA_MQTT.h"
 #include <esp_timer.h>
 #include <esp_wifi.h>
+#if defined(ARDUINO_ARCH_ESP32)
+#include <esp_system.h>
+#endif
 #include <nvs.h>
 #include <cstdarg>
 #include <cerrno>
@@ -1102,7 +1105,6 @@ bool ESP32_SMA_MQTT::brokerConnect() {
 
   // client.setCallback(callback);
   if (!ESP32_SMA_Inverter_App::client.connected()) {
-      espDiscoveryPublished = false;
       logW("The client %s connects to the mqtt broker %s ", mqttInstance.sapString.c_str(), config.mqttBroker.c_str());
       // If there is a user account
       if(config.mqttUser.length() > 0){
@@ -1117,8 +1119,11 @@ bool ESP32_SMA_MQTT::brokerConnect() {
         }
       }
       if (ESP32_SMA_Inverter_App::client.connected()) {
+        ++mqttConnects;
+        // Discovery configs are retained by the broker, so a reconnect does
+        // not need to resend them. Home Assistant's "online" birth message
+        // (subscribed here) still triggers a full re-announcement.
         ESP32_SMA_Inverter_App::client.subscribe("homeassistant/status");
-        ESP32_SMA_Inverter_App::getInstance().requestDiscovery();
       }
     }
   return ESP32_SMA_Inverter_App::client.connected();
@@ -1282,7 +1287,16 @@ bool ESP32_SMA_MQTT::publishEspDiscovery(const char *stateTopic) {
     {"wifi_rssi", "Wi-Fi signal", "WiFiRSSI", "signal_strength", "dBm"},
     {"uptime", "Uptime", "Uptime", "duration", "s"},
     {"free_heap", "Free heap", "FreeHeap", "data_size", "B"},
+    {"last_poll_ms", "Last poll duration", "LastPollMs", "duration", "ms"},
+    {"max_poll_ms", "Longest poll duration", "MaxPollMs", "duration", "ms"},
+    {"poll_timeouts", "Last poll reply timeouts", "LastPollTimeouts", nullptr, nullptr},
+    {"poll_result", "Last poll result", "LastPollResult", nullptr, nullptr},
+    {"poll_failures", "Failed polls", "PollFailures", nullptr, nullptr},
+    {"mqtt_connects", "MQTT connects", "MqttConnects", nullptr, nullptr},
+    {"reset_reason", "Reset reason", "ResetReason", nullptr, nullptr},
   };
+  // Only the original four sensors ever had configs under the old device.
+  constexpr size_t legacySensorCount = 4;
   AppConfig& config = ESP32_SMA_Inverter_App::getInstance().appConfig;
   InverterData& invData = ESP32_SMA_Inverter::getInstance().invData;
   const uint32_t serial = invData.Serial != 0 ? invData.Serial : config.thisSerial;
@@ -1299,7 +1313,8 @@ bool ESP32_SMA_MQTT::publishEspDiscovery(const char *stateTopic) {
       !ESP32_SMA_Inverter_App::client.publish(inverterTimeTopic, "", true)) return false;
   // Retained configs from older firmware keep the separate ESP32 device alive.
   // Remove them before publishing the same entities under the inverter device.
-  for (const Sensor& sensor : sensors) {
+  for (size_t n = 0; n < legacySensorCount; ++n) {
+    const Sensor& sensor = sensors[n];
     char oldTopic[128];
     snprintf(oldTopic, sizeof(oldTopic),
              "homeassistant/sensor/%s/esp_%s/config", sapString.c_str(), sensor.id);
@@ -1338,6 +1353,26 @@ bool ESP32_SMA_MQTT::publishEspDiscovery(const char *stateTopic) {
   return success;
 }
 
+static const char *resetReasonText() {
+#if defined(ARDUINO_ARCH_ESP32)
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return "power-on";
+    case ESP_RST_EXT: return "external pin";
+    case ESP_RST_SW: return "software restart";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "interrupt watchdog";
+    case ESP_RST_TASK_WDT: return "task watchdog";
+    case ESP_RST_WDT: return "other watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep sleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "SDIO";
+    default: return "unknown";
+  }
+#else
+  return "host";
+#endif
+}
+
 bool ESP32_SMA_MQTT::publishEspStatus(bool serviceDiscovery) {
   AppConfig& config = ESP32_SMA_Inverter_App::getInstance().appConfig;
   if (config.mqttBroker.isEmpty() || WiFi.status() != WL_CONNECTED) return false;
@@ -1358,12 +1393,23 @@ bool ESP32_SMA_MQTT::publishEspStatus(bool serviceDiscovery) {
     if (espDiscoveryPublished) espDiscoveredSerial = serial;
   }
 
-  StaticJsonDocument<256> status;
+  const PollStats& polls = ESP32_SMA_Inverter_App::getInstance().pollStats();
+  StaticJsonDocument<768> status;
   status["IP"] = WiFi.localIP().toString();
   status["WiFiRSSI"] = WiFi.RSSI();
   status["Uptime"] = (uint64_t)(esp_timer_get_time() / 1000000LL);
   status["FreeHeap"] = ESP.getFreeHeap();
-  char payload[256];
+  status["LastPollMs"] = polls.lastDurationMs;
+  status["MaxPollMs"] = polls.maxDurationMs;
+  status["LastPollTimeouts"] = polls.lastReplyTimeouts;
+  status["LastPollResult"] = polls.lastOutcome;
+  status["Polls"] = polls.polls;
+  status["PollFailures"] = polls.failures;
+  status["MqttConnects"] = mqttConnects;
+  status["ResetReason"] = resetReasonText();
+  status["PollTask"] = ESP32_SMA_Inverter_App::getInstance().pollTaskRunning();
+  char payload[512];
+  if (status.overflowed() || measureJson(status) >= sizeof(payload)) return false;
   size_t length = serializeJson(status, payload, sizeof(payload));
   return length > 0 && ESP32_SMA_Inverter_App::client.publish(
       stateTopic, reinterpret_cast<const uint8_t*>(payload), length, false);

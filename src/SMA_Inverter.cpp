@@ -133,6 +133,17 @@ bool ESP32_SMA_Inverter::takeReconnectRequest() {
   return requested;
 }
 
+void ESP32_SMA_Inverter::beginPollBudget(uint32_t budgetMs) {
+  replyTimeouts = 0;
+  pollBudgetExpired = false;
+  pollBudgetDeadline = millis() + budgetMs;
+  pollBudgetActive = budgetMs != 0;
+}
+
+void ESP32_SMA_Inverter::endPollBudget() {
+  pollBudgetActive = false;
+}
+
 bool ESP32_SMA_Inverter::disconnect() {
   discardBtRx.store(true, std::memory_order_release);
   bool bGotDisconnected = serialBT.disconnect();
@@ -444,7 +455,7 @@ E_RC ESP32_SMA_Inverter::getInverterDataCfl(uint32_t command, uint32_t first, ui
   } transaction(invData, dispData, cflSnapshot, cflDisplaySnapshot);
 
   const uint32_t queryStarted = millis();
-  const uint32_t queryDeadline = queryStarted + 30000UL;
+  const uint32_t queryDeadline = queryStarted + queryTimeoutMs;
   if ((first >> 8) <= DcMsVol && (last >> 8) >= DcMsAmp) {
     for (size_t k = 0; k < 2; ++k) {
       invData.Udc[k] = invData.Idc[k] = INT32_MIN;
@@ -892,7 +903,7 @@ bool ESP32_SMA_Inverter::getBT_SignalStrength() {
 E_RC ESP32_SMA_Inverter::initialiseSMAConnection() {
   //extern uint8_t sixff[6];
   logI(" -> Initialize");
-  const uint32_t operationDeadline = millis() + 20000UL;
+  const uint32_t operationDeadline = millis() + replyTimeoutMs;
   E_RC rc = getPacket(invData.BTAddress, 2, &operationDeadline); // 1. Receive
   if (rc != E_OK || pcktBufPos <= 22) return (rc == E_OK) ? E_INVRESP : rc;
   invData.NetID = pcktBuf[22];
@@ -989,7 +1000,7 @@ E_RC ESP32_SMA_Inverter::readPlantTime(int32_t *currentTime, int32_t *lastTimeSe
 
   if (!BTsendPacket(pcktBuf)) return E_NODATA;
   const uint32_t started = millis();
-  const uint32_t operationDeadline = started + 20000UL;
+  const uint32_t operationDeadline = started + replyTimeoutMs;
   bool matched = false;
   for (unsigned attempt = 0; attempt < 4 && (int32_t)(millis() - operationDeadline) < 0; ++attempt) {
     E_RC rc = getPacket(invData.BTAddress, 1, &operationDeadline);
@@ -1133,7 +1144,7 @@ E_RC ESP32_SMA_Inverter::logonSMAInverter(const char *password, const uint8_t us
     if (!BTsendPacket(pcktBuf)) return E_NODATA;
 
     const uint32_t receiveStarted = millis();
-    const uint32_t operationDeadline = receiveStarted + 20000UL;
+    const uint32_t operationDeadline = receiveStarted + replyTimeoutMs;
     constexpr unsigned maxLoginReplies = 10;
     for (unsigned attempt = 0; attempt < maxLoginReplies &&
          (int32_t)(millis() - operationDeadline) < 0; ++attempt) {
@@ -1362,10 +1373,17 @@ uint8_t ESP32_SMA_Inverter::BTgetByte(const uint32_t *callerDeadline) {
 
   while (true) {
     const uint32_t now = millis();
-    if ((uint32_t)(now - started) >= 20000UL ||
+    if ((uint32_t)(now - started) >= replyTimeoutMs ||
         (callerDeadline && (int32_t)(now - *callerDeadline) >= 0) ||
-        (receivingPacket && (uint32_t)(now - receiveStarted) >= 20000UL)) {
+        (receivingPacket && (uint32_t)(now - receiveStarted) >= replyTimeoutMs)) {
       DEBUG2_PRINTLN("BTgetByte Timeout");
+      readTimeout = true;
+      ++replyTimeouts;
+      break;
+    }
+    if (pollBudgetActive && (int32_t)(now - pollBudgetDeadline) >= 0) {
+      if (!pollBudgetExpired) logW("Inverter poll budget exhausted; abandoning this poll");
+      pollBudgetExpired = true;
       readTimeout = true;
       break;
     }

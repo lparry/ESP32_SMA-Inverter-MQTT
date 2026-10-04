@@ -473,12 +473,12 @@ int main() {
   assert(WiFi.smartConfigBegins == 1);
   fake::ticks += 2000;
   auto& app = ESP32_SMA_Inverter_App::getInstance();
-  app.pollingInProgress = true;
+  app.pollState.store(ESP32_SMA_Inverter_App::POLL_RUNNING);
   mqtt.wifiLoop();
-  app.pollingInProgress = false;
+  app.pollState.store(ESP32_SMA_Inverter_App::POLL_IDLE);
   mqtt.wifiLoop(true);
   assert(WiFi.smartConfigBegins == 1);
-  app.pollingInProgress = false;
+  app.pollState.store(ESP32_SMA_Inverter_App::POLL_IDLE);
   WiFi.connectOnSmartConfig = true;
   try {
     mqtt.wifiLoop();

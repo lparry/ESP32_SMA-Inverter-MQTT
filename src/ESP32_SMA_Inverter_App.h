@@ -7,6 +7,7 @@
 #include <WiFiClient.h>
 #include "BoundedWebServer.h"
 #include <PubSubClient.h>
+#include <atomic>
 
 #include <BluetoothSerial.h>
 
@@ -41,6 +42,44 @@
 #endif
 
 
+
+// One inverter transaction, from Bluetooth connect to disconnect. The main
+// loop builds the job; the poll task (or, on host builds, the caller) runs it.
+struct PollJob {
+    bool unpairFirst = false;
+    bool clockSync = false;
+    uint32_t clockSyncDeadline = 0;
+    uint32_t clockSyncGeneration = 0;
+    int32_t utcOffsetSeconds = 0;
+    bool nightTime = false;
+    uint32_t intervalMs = 0;
+};
+
+struct PollResult {
+    bool connected = false;
+    bool readOk = false;
+    int rc = 0;
+    bool reconnectRequested = false;
+    bool unpairOk = false;
+    bool clockSyncAttempted = false;
+    String clockSyncStatus;
+    bool budgetExhausted = false;
+    uint16_t replyTimeouts = 0;
+    uint32_t durationMs = 0;
+    uint32_t finishedMillis = 0;
+    InverterData reading = {};
+    DisplayData display = {};
+};
+
+// Main-loop view of polling health, published with the ESP diagnostics.
+struct PollStats {
+    uint32_t polls = 0;
+    uint32_t failures = 0;
+    uint32_t lastDurationMs = 0;
+    uint32_t maxDurationMs = 0;
+    uint16_t lastReplyTimeouts = 0;
+    const char *lastOutcome = "none";
+};
 
 struct AppConfig {
     String mqttBroker;
@@ -98,11 +137,13 @@ class ESP32_SMA_Inverter_App : public ESP32Loggable {
      void requestClockSync();
      void requestDiscovery() { firstTime = true; nextDiscoveryAttempt = millis(); }
      String getClockSyncStatus() const { return clockSyncStatus; }
-     bool isPolling() const { return pollingInProgress; }
+     bool isPolling() const { return pollState.load(std::memory_order_acquire) != POLL_IDLE; }
      bool configurationStorageReady() const { return configurationStorageAvailable; }
      const DisplayData& lastDisplayData() const {
-       return hasSuccessfulRead ? pendingDisplay : ESP32_SMA_Inverter::dispData;
+       return hasSuccessfulRead ? pendingDisplay : lastAttemptDisplay;
      }
+     const PollStats& pollStats() const { return stats; }
+     bool pollTaskRunning() const { return pollTaskAvailable; }
 
     protected:
       //extern BluetoothSerial serialBT;
@@ -147,7 +188,28 @@ class ESP32_SMA_Inverter_App : public ESP32Loggable {
         bool serialCommandOverflow = false;
         void handleSerialCommands();
         void initializeBluetoothIfDue();
-        bool pollingInProgress = false;
+        // Poll hand-off. IDLE: main loop owns smaInverter and invData/dispData.
+        // RUNNING: the poll task owns them. DONE: main loop owns them again
+        // and must consume pollResult before the next job.
+        enum : uint8_t { POLL_IDLE = 0, POLL_RUNNING = 1, POLL_DONE = 2 };
+        std::atomic<uint8_t> pollState{POLL_IDLE};
+        PollJob activeJob;
+        PollResult pollResult;
+        PollStats stats;
+        DisplayData lastAttemptDisplay = {};
+        InverterData pollRollback = {};
+        DisplayData pollDisplayRollback = {};
+        bool pollTaskAvailable = false;
+        bool pollRequestedWhileBusy = false;
+        bool unpairRequested = false;
+        bool lastRelayClosed = false;
+        uint32_t clockSyncGeneration = 0;
+        void startPollWorker();
+        void dispatchPoll(const PollJob& job);
+        void runPollJob();
+        void processPollResult();
+        void requestPollNow();
+        static void pollTaskEntry(void *arg);
         bool readingPending = false;
         InverterData pendingReading = {};
         DisplayData pendingDisplay = {};

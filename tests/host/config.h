@@ -19,3 +19,9 @@
 #define TIMEZONE 0
 #define NTPHOSTNAME "pool.ntp.org"
 #define THISSERIAL 123
+
+// The legacy deadline regressions were written against 20 s reply and 30 s
+// query windows. Firmware defaults are shorter; testConfigurableTimeouts
+// exercises those values at runtime.
+#define SMA_REPLY_TIMEOUT_MS 20000UL
+#define SMA_QUERY_TIMEOUT_MS 30000UL

@@ -34,7 +34,11 @@ The inverter is added as a device, while all the inverter parameters are defined
 
 The ESP32 also publishes its own diagnostics every 60 seconds, even while the inverter is asleep.
 Its state topic is `sma/solar/SMA-XXXXXXXX/esp/state` and contains `IP`, `WiFiRSSI`
-(dBm), `Uptime` (seconds), and `FreeHeap` (bytes).
+(dBm), `Uptime` (seconds), and `FreeHeap` (bytes), plus polling and connection health:
+`LastPollMs` and `MaxPollMs` (connect-to-disconnect duration), `LastPollTimeouts` (Bluetooth
+reply timeouts in the last poll), `LastPollResult` (`ok`, `no connection`, `reply timeout`,
+`read failed` or `poll budget exhausted`), `Polls`, `PollFailures`, `MqttConnects` (successful
+broker connections since boot), `ResetReason` and `PollTask`.
 With Home Assistant discovery enabled, these appear as diagnostic sensors on the inverter
 device, including its ESP32 IP address and a link to the web UI. Sensor states expire after
 180 seconds if the ESP stops publishing. MQTT state messages are not retained. The status
@@ -43,12 +47,27 @@ requires the configured MQTT username and password when a username is configured
 MQTT username, those pages remain open.
 
 
+### Polling and network servicing
+
+Inverter polling runs on its own FreeRTOS task. Bluetooth waits no longer block the main
+loop, so MQTT keepalives, diagnostics publishing and the web UI continue while a slow or
+half-awake inverter is being read. The next poll is scheduled one scan interval after the
+previous poll *finishes*. Each Bluetooth reply waits at most `SMA_REPLY_TIMEOUT_MS` (8 s),
+each multi-packet query `SMA_QUERY_TIMEOUT_MS` (12 s), and a whole poll `SMA_POLL_BUDGET_MS`
+(90 s); all three can be overridden in `config_values.h`. If the poll task cannot be created,
+polling falls back to the main loop as before.
+
+Home Assistant discovery is retained by the broker, so a broker reconnect does not resend it.
+Discovery is republished at boot, when Home Assistant sends its `online` birth message, when
+day/night expiry changes, and when the inverter identity changes. Readings are only held back
+until this inverter's entities have been announced once.
+
 ### Bluetooth recovery over USB
 
 At 115200 baud, send `unpair` followed by a newline after switching firmware or
 when Bluetooth authentication fails. This removes only the configured inverter's
-saved bond, confirms that it is absent, and retries the connection immediately,
-including at night. The Bluetooth pairing PIN remains `0000`.
+saved bond (on the poll task, before the next connection), confirms that it is absent,
+and retries the connection immediately, including at night. The Bluetooth pairing PIN remains `0000`.
 
 Send `poll` followed by a newline to request an inverter read without waiting for
 the normal night interval. Neither command sets the inverter clock.
@@ -77,6 +96,8 @@ Bluetooth receive or inverter poll is active.
 
 Hardware evidence is recorded in the [night-time verification](docs/nighttime-verification-2026-09-30.md)
 and [producing-inverter comparison](docs/daytime-comparison-2026-10-01.md).
+The MQTT starvation analysis and poll-task change are in
+[docs/mqtt-starvation-2026-10-04.md](docs/mqtt-starvation-2026-10-04.md).
 
 ### NOTES:
 
