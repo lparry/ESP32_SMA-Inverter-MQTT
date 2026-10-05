@@ -302,7 +302,12 @@ void ESP32_SMA_Inverter_App::pollTaskEntry(void *arg) {
 }
 
 void ESP32_SMA_Inverter_App::startPollWorker() {
-#if defined(ARDUINO_ARCH_ESP32)
+  // Opt-in only. On hardware, running Bluetooth connects on a separate task
+  // while the main loop services Wi-Fi made almost every SPP connect fail
+  // (ESP_SPP_DISCOVERY_COMP_EVT status 1): 0/5 polls with the task versus
+  // 4/5 inline on the same build, position and evening (2026-10-05). Inline
+  // polling with the shorter reply timeouts keeps polls to a few seconds.
+#if defined(ARDUINO_ARCH_ESP32) && defined(SMA_POLL_TASK)
   if (pollTaskAvailable) return;
   // Same stack size as the Arduino loop task the poll previously ran on.
   if (xTaskCreatePinnedToCore(pollTaskEntry, "sma-poll", SMA_POLL_TASK_STACK, this, 1,

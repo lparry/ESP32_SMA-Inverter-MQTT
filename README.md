@@ -49,13 +49,13 @@ MQTT username, those pages remain open.
 
 ### Polling and network servicing
 
-Inverter polling runs on its own FreeRTOS task. Bluetooth waits no longer block the main
-loop, so MQTT keepalives, diagnostics publishing and the web UI continue while a slow or
-half-awake inverter is being read. The next poll is scheduled one scan interval after the
-previous poll *finishes*. Each Bluetooth reply waits at most `SMA_REPLY_TIMEOUT_MS` (8 s),
-each multi-packet query `SMA_QUERY_TIMEOUT_MS` (12 s), and a whole poll `SMA_POLL_BUDGET_MS`
-(90 s); all three can be overridden in `config_values.h`. If the poll task cannot be created,
-polling falls back to the main loop as before.
+Inverter polling runs inline in the main loop. Each Bluetooth reply waits at most
+`SMA_REPLY_TIMEOUT_MS` (8 s), each multi-packet query `SMA_QUERY_TIMEOUT_MS` (12 s), and a whole
+poll `SMA_POLL_BUDGET_MS` (90 s), so a healthy poll takes a few seconds; all three can be
+overridden in `config_values.h`. The next poll is scheduled one scan interval after the previous
+poll *finishes*. A dedicated FreeRTOS poll task exists behind `#define SMA_POLL_TASK`, but it is
+off by default: on hardware, Bluetooth connects made from that task while the main loop serviced
+Wi-Fi failed almost every time (0/5 versus 4/5 inline on the same build, position and evening).
 
 Home Assistant discovery is retained by the broker, so a broker reconnect does not resend it.
 Discovery is republished at boot, when Home Assistant sends its `online` birth message, when
