@@ -313,6 +313,9 @@ class ESP32_SMA_Inverter : public ESP32Loggable {
     }
 
     bool begin(String localName, bool isMaster);
+    // Tear down the Bluetooth stack (SPP, Bluedroid and controller) so the
+    // next begin() starts from a clean radio state.
+    void end();
 
     static InverterData invData;
     //static InverterData *pInvData;// = &invData;

@@ -72,6 +72,14 @@ bool ESP32_SMA_Inverter::begin(String localName, bool isMaster) {
 }
 
 
+void ESP32_SMA_Inverter::end() {
+  disconnect();
+  serialBT.end();
+  btRxCallbackActive.store(false, std::memory_order_release);
+  btConnected = false;
+  authRecoveryAttempted = false;
+}
+
 bool ESP32_SMA_Inverter::connect(uint8_t remoteAddress[]) {
   // Close any prior link and discard its queued data before accepting bytes
   // from the next connection attempt. The inverter sends its first handshake

@@ -61,6 +61,15 @@
 #ifndef SMA_POLL_BUDGET_MS
 #define SMA_POLL_BUDGET_MS 90000UL
 #endif
+// After this many consecutive daytime connect failures (and every multiple of
+// it) the Bluetooth stack is restarted. The ESP itself is not rebooted.
+#ifndef SMA_BT_RESTART_AFTER_FAILS
+#define SMA_BT_RESTART_AFTER_FAILS 6
+#endif
+// Longest wait between connect attempts while the inverter is unreachable.
+#ifndef SMA_CONNECT_BACKOFF_MAX_MS
+#define SMA_CONNECT_BACKOFF_MAX_MS (15UL * 60UL * 1000UL)
+#endif
 #ifndef SMA_POLL_TASK_STACK
 #define SMA_POLL_TASK_STACK 8192
 #endif

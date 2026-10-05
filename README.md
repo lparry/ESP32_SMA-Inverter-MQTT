@@ -62,6 +62,13 @@ Discovery is republished at boot, when Home Assistant sends its `online` birth m
 day/night expiry changes, and when the inverter identity changes. Readings are only held back
 until this inverter's entities have been announced once.
 
+When the inverter cannot be reached in daylight, the ESP no longer reboots. After two failed
+connections the next attempt waits 2 minutes, then 5, then `SMA_CONNECT_BACKOFF_MAX_MS`
+(15 min). Every `SMA_BT_RESTART_AFTER_FAILS` (6) consecutive failures the Bluetooth stack
+alone is restarted, so Wi-Fi and MQTT stay connected. A successful connection, nightfall or a
+USB `poll` command resets this. `ConnectFailStreak` and `BtRestarts` in `esp/state` (and the
+"Bluetooth restarts" diagnostic sensor) show it happening.
+
 ### Bluetooth recovery over USB
 
 At 115200 baud, send `unpair` followed by a newline after switching firmware or

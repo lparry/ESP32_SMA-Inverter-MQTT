@@ -80,6 +80,15 @@ static String formatLocalEpoch(int32_t epoch) {
   return String(formatted);
 }
 
+// Delay before the next poll after consecutive daytime connect failures. The
+// first couple keep the normal scan rate; the processor uses the larger value.
+static uint32_t connectFailBackoffMs(uint32_t failures) {
+  if (failures <= 2) return 0;
+  if (failures == 3) return 2UL * 60UL * 1000UL;
+  if (failures == 4) return 5UL * 60UL * 1000UL;
+  return SMA_CONNECT_BACKOFF_MAX_MS;
+}
+
 static uint32_t measurementExpirySeconds(bool nightTime, int scanRate) {
   return nightTime
       ? static_cast<uint32_t>(max(2700, (NIGHTSCANRATE / 1000) * 3))
@@ -465,23 +474,40 @@ void ESP32_SMA_Inverter_App::processPollResult() {
       lastSuccessfulReadMillis = result.finishedMillis;
     }
     failCount=0;
-  } else if (!job.nightTime) {
-    // Inverter shuts down at night so no bluetooth. Don't bother rebooting, just keep trying
-    mqttInstanceForApp.logViaMQTT("Bluetooth failed to connect");
+  } else if (job.nightTime) {
+    // The inverter's Bluetooth is off at night; that is not a fault.
+    failCount = 0;
+  } else {
+    // Daytime connect failure. Rebooting the ESP used to cost a 1-2 minute
+    // Wi-Fi/MQTT outage every few minutes while the inverter was unreachable.
+    // Instead back off, and periodically restart only the Bluetooth stack.
     failCount++;
-    if( failCount > 5 ) {
-      logW("Failed to connect 5 times: Reboot\n");
-      mqttInstanceForApp.logViaMQTT("Rebooting after 5 failed Bluetooth connections");
-      ESP.restart();
-    }
+    mqttInstanceForApp.logViaMQTT("Bluetooth failed to connect");
+    if (failCount % SMA_BT_RESTART_AFTER_FAILS == 0) restartBluetooth();
   }
+  stats.connectFailStreak = (uint32_t)failCount;
 
-  const uint32_t interval = lastAdjustedScanRate > 0 ? (uint32_t)lastAdjustedScanRate : job.intervalMs;
+  uint32_t interval = lastAdjustedScanRate > 0 ? (uint32_t)lastAdjustedScanRate : job.intervalMs;
+  const uint32_t backoff = connectFailBackoffMs((uint32_t)failCount);
+  if (backoff > interval) interval = backoff;
   if (result.reconnectRequested) nextTime = millis() + 1000UL;
   else if (pollRequestedWhileBusy) nextTime = millis();
   else nextTime = millis() + interval;
   pollRequestedWhileBusy = false;
   pollState.store(POLL_IDLE, std::memory_order_release);
+}
+
+// Restart the Bluetooth stack without rebooting, so Wi-Fi and MQTT stay up.
+// initializeBluetoothIfDue() brings it back with its own retry backoff.
+void ESP32_SMA_Inverter_App::restartBluetooth() {
+  ++stats.btRestarts;
+  logW("%d consecutive Bluetooth connect failures: restarting Bluetooth", failCount);
+  mqttInstanceForApp.logViaMQTT("Restarting Bluetooth after repeated connect failures");
+  smaInverter.setServiceCallback(nullptr);
+  smaInverter.end();
+  bluetoothReady = false;
+  bluetoothInitRetryScheduled = false;
+  bluetoothInitRetryMs = 1000UL;
 }
 
 void ESP32_SMA_Inverter_App::handleSerialCommands() {

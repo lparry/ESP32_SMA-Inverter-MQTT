@@ -78,6 +78,8 @@ struct PollStats {
     uint32_t lastDurationMs = 0;
     uint32_t maxDurationMs = 0;
     uint16_t lastReplyTimeouts = 0;
+    uint32_t connectFailStreak = 0;   // consecutive daytime connect failures
+    uint32_t btRestarts = 0;          // Bluetooth stack restarts since boot
     const char *lastOutcome = "none";
 };
 
@@ -208,6 +210,7 @@ class ESP32_SMA_Inverter_App : public ESP32Loggable {
         void dispatchPoll(const PollJob& job);
         void runPollJob();
         void processPollResult();
+        void restartBluetooth();
         void requestPollNow();
         static void pollTaskEntry(void *arg);
         bool readingPending = false;

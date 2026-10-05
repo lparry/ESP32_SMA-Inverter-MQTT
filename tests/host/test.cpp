@@ -968,7 +968,7 @@ void testDiscoveryCapacity(){
  size_t diagnostics=0;for(auto&message:a.client.messages){if(message.payload.empty())continue;
   StaticJsonDocument<2048> json;assert(!deserializeJson(json,message.payload));if(json["entity_category"]=="diagnostic")++diagnostics;
  }
- assert(diagnostics==11); // four device sensors plus seven poll/MQTT health sensors
+ assert(diagnostics==12); // four device sensors plus eight poll/MQTT/Bluetooth health sensors
  char tiny[20];m.discoveryPublishOK=true;auto count=a.client.messages.size();
  m.sendHassAutoNoClassNoUnit(tiny,sizeof(tiny),2700,"SMA-1","Status","DevStatus","DevStatus");
  assert(!m.discoveryPublishOK);assert(a.client.messages.size()==count);i.invData.Serial=0;
@@ -1836,12 +1836,47 @@ void testPollResultScheduling(){
  a.stats=savedStats;a.nextTime=savedNext;a.lastAdjustedScanRate=savedRate;a.clockSyncRequested=savedClock;
  a.clockSyncGeneration=savedGen;a.clockSyncStatus=savedStatus;a.readingPending=savedPending;a.hasSuccessfulRead=savedRead;a.failCount=savedFail;
 }
+void testDaytimeConnectFailuresRestartBluetoothNotEsp(){
+ auto&a=ESP32_SMA_Inverter_App::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();auto&b=i.serialBT;
+ const auto savedStats=a.stats;const auto savedNext=a.nextTime;const auto savedRate=a.lastAdjustedScanRate;
+ const auto savedFail=a.failCount;const bool savedReady=a.bluetoothReady;
+ fake::ticks=9000000;a.lastAdjustedScanRate=60000;a.stats=PollStats();a.failCount=0;a.bluetoothReady=true;
+ const unsigned endCalls=b.endCalls;
+ auto fail=[&](bool night){
+  a.activeJob=PollJob();a.activeJob.nightTime=night;a.activeJob.intervalMs=60000;
+  a.pollResult=PollResult();a.pollResult.connected=false;a.pollResult.finishedMillis=millis();
+  a.pollState.store(ESP32_SMA_Inverter_App::POLL_DONE);a.processPollResult();  // must not throw fake::Restart
+ };
+ // Two failures keep the scan rate, then the wait grows to 2, 5 and 15 minutes.
+ fail(false);assert(dueWithin(a.nextTime,60000));fail(false);assert(dueWithin(a.nextTime,60000));
+ fail(false);assert(dueWithin(a.nextTime,120000));fail(false);assert(dueWithin(a.nextTime,300000));
+ fail(false);assert(dueWithin(a.nextTime,(int32_t)SMA_CONNECT_BACKOFF_MAX_MS));
+ assert(a.stats.btRestarts==0&&a.bluetoothReady&&b.endCalls==endCalls);
+ // The sixth consecutive failure restarts only the Bluetooth stack.
+ fail(false);assert(a.stats.btRestarts==1&&a.stats.connectFailStreak==6);
+ assert(!a.bluetoothReady&&b.endCalls==endCalls+1&&!i.btRxCallbackActive.load());
+ assert(dueWithin(a.nextTime,(int32_t)SMA_CONNECT_BACKOFF_MAX_MS));
+ // initializeBluetoothIfDue() brings Bluetooth back on the next loop pass.
+ const unsigned beginCalls=b.beginCalls;const bool savedBegin=b.beginResult;const auto savedResults=b.beginResults;
+ const bool savedAddr=a.bluetoothAddressValid;const auto savedSmart=a.smartConfig;
+ b.beginResult=true;b.beginResults.clear();a.bluetoothAddressValid=true;a.smartConfig=0;
+ a.initializeBluetoothIfDue();assert(a.bluetoothReady&&b.beginCalls==beginCalls+1);
+ b.beginResult=savedBegin;b.beginResults=savedResults;a.bluetoothAddressValid=savedAddr;a.smartConfig=savedSmart;
+ // Night failures are expected and clear the streak; so does a connection.
+ fail(true);assert(a.failCount==0&&a.stats.connectFailStreak==0&&dueWithin(a.nextTime,60000));
+ fail(false);fail(false);fail(false);assert(a.failCount==3);
+ a.pollResult=PollResult();a.pollResult.connected=true;a.pollResult.finishedMillis=millis();
+ a.pollState.store(ESP32_SMA_Inverter_App::POLL_DONE);a.processPollResult();
+ assert(a.failCount==0&&dueWithin(a.nextTime,60000));
+ a.stats=savedStats;a.nextTime=savedNext;a.lastAdjustedScanRate=savedRate;a.failCount=savedFail;a.bluetoothReady=savedReady;
+}
 void testEspStatusReportsPollHealth(){
  auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();
  auto config=a.appConfig;const auto savedStats=a.stats;const bool savedLoaded=m.discoveryIdentityLoaded;const String savedIdentity=m.discoveryIdentity;
  a.appConfig.mqttBroker="broker";a.appConfig.hassDisc=true;a.appConfig.mqttTopic="SMA";a.appConfig.thisSerial=88;
  m.discoveryIdentityLoaded=true;m.discoveryIdentity="SMA-88";WiFi.state=WL_CONNECTED;a.client.online=false;a.client.publishOK=true;
  a.stats.polls=12;a.stats.failures=2;a.stats.lastDurationMs=4321;a.stats.maxDurationMs=91000;a.stats.lastReplyTimeouts=1;a.stats.lastOutcome="ok";
+ a.stats.btRestarts=3;a.stats.connectFailStreak=4;
  m.espDiscoveryPublished=false;m.lastEspStatusMillis=0;a.client.messages.clear();const uint32_t connects=m.mqttConnects;
  assert(m.publishEspStatus(true));assert(m.mqttConnects==connects+1);
  bool sawState=false;unsigned diagnosticConfigs=0;
@@ -1850,10 +1885,11 @@ void testEspStatusReportsPollHealth(){
    sawState=true;StaticJsonDocument<1024> json;assert(msg.payload.size()<512);assert(!deserializeJson(json,msg.payload));
    assert(json["LastPollMs"]==4321&&json["MaxPollMs"]==91000&&json["PollFailures"]==2&&json["Polls"]==12);
    assert(json["LastPollResult"]=="ok"&&json["MqttConnects"]==connects+1&&json["ResetReason"]=="host");
+   assert(json["BtRestarts"]==3&&json["ConnectFailStreak"]==4);
   }
   if(msg.topic.find("homeassistant/sensor/SMA-88/esp_")==0&&!msg.payload.empty())++diagnosticConfigs;
  }
- assert(sawState);assert(diagnosticConfigs==11);
+ assert(sawState);assert(diagnosticConfigs==12);
  a.appConfig=config;a.stats=savedStats;m.discoveryIdentityLoaded=savedLoaded;m.discoveryIdentity=savedIdentity;a.client.messages.clear();
 }
 int main(){
@@ -1927,6 +1963,7 @@ int main(){
  testReannouncementDoesNotHoldReadings();
  testConfigurableTimeoutsAndPollBudget();
  testPollResultScheduling();
+ testDaytimeConnectFailuresRestartBluetoothNotEsp();
  testEspStatusReportsPollHealth();
  InverterData identity{}; identity.SUSyID=0x1234; assert(identity.SUSyID==0x1234);
  uint8_t bytes[]={0x78,0x56,0x34,0x12,0,0,0,0};

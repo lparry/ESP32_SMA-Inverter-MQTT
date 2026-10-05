@@ -1293,6 +1293,7 @@ bool ESP32_SMA_MQTT::publishEspDiscovery(const char *stateTopic) {
     {"poll_result", "Last poll result", "LastPollResult", nullptr, nullptr},
     {"poll_failures", "Failed polls", "PollFailures", nullptr, nullptr},
     {"mqtt_connects", "MQTT connects", "MqttConnects", nullptr, nullptr},
+    {"bt_restarts", "Bluetooth restarts", "BtRestarts", nullptr, nullptr},
     {"reset_reason", "Reset reason", "ResetReason", nullptr, nullptr},
   };
   // Only the original four sensors ever had configs under the old device.
@@ -1406,6 +1407,8 @@ bool ESP32_SMA_MQTT::publishEspStatus(bool serviceDiscovery) {
   status["Polls"] = polls.polls;
   status["PollFailures"] = polls.failures;
   status["MqttConnects"] = mqttConnects;
+  status["ConnectFailStreak"] = polls.connectFailStreak;
+  status["BtRestarts"] = polls.btRestarts;
   status["ResetReason"] = resetReasonText();
   status["PollTask"] = ESP32_SMA_Inverter_App::getInstance().pollTaskRunning();
   char payload[512];
