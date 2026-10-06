@@ -202,7 +202,7 @@ void ESP32_SMA_Inverter_App::appLoop() {
   if (pollIdle) lastRelayClosed = ESP32_SMA_Inverter::invData.GridRelay == 51;
   // A single failed connect must not end daytime: every day/night flip
   // re-announces discovery and blanks the Home Assistant sensors.
-  const uint32_t relayFreshnessMs = max((uint32_t)SMA_DAY_HOLD_MS,
+  const uint32_t relayFreshnessMs = std::max<uint32_t>(SMA_DAY_HOLD_MS,
       (uint32_t)constrain(appConfig.scanRate, 10, 3600) * 2000UL);
   const bool freshClosedRelay = hasSuccessfulRead && lastRelayClosed &&
       (uint32_t)(millis() - lastSuccessfulReadMillis) < relayFreshnessMs;
