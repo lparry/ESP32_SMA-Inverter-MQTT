@@ -90,8 +90,10 @@ static uint32_t connectFailBackoffMs(uint32_t failures) {
 }
 
 static uint32_t measurementExpirySeconds(bool nightTime, int scanRate) {
+  // At night the inverter's Bluetooth often misses scans; allow up to three
+  // in a row before sensors expire.
   return nightTime
-      ? static_cast<uint32_t>(max(2700, (NIGHTSCANRATE / 1000) * 3))
+      ? static_cast<uint32_t>(max(2700, (NIGHTSCANRATE / 1000) * 4 + 300))
       : static_cast<uint32_t>(max(300, constrain(scanRate, 10, 3600) * 3 + 60));
 }
 
@@ -198,7 +200,10 @@ void ESP32_SMA_Inverter_App::appLoop() {
   // invData belongs to the poll task while a poll is running. Use the last
   // relay state observed while idle until the poll hands the data back.
   if (pollIdle) lastRelayClosed = ESP32_SMA_Inverter::invData.GridRelay == 51;
-  const uint32_t relayFreshnessMs = max(120, constrain(appConfig.scanRate, 10, 3600) * 2) * 1000UL;
+  // A single failed connect must not end daytime: every day/night flip
+  // re-announces discovery and blanks the Home Assistant sensors.
+  const uint32_t relayFreshnessMs = max((uint32_t)SMA_DAY_HOLD_MS,
+      (uint32_t)constrain(appConfig.scanRate, 10, 3600) * 2000UL);
   const bool freshClosedRelay = hasSuccessfulRead && lastRelayClosed &&
       (uint32_t)(millis() - lastSuccessfulReadMillis) < relayFreshnessMs;
 // Check if the Sun is up or a recent reading reports the grid relay closed
@@ -263,6 +268,14 @@ void ESP32_SMA_Inverter_App::appLoop() {
       firstTime = false;
       dayNight = nightTime;
       discoveredSerial = currentSerial;
+      // Re-announced entities stay unavailable until the next state message,
+      // which could be a whole scan (or backoff) away. Resend the latest
+      // reading once Home Assistant has had a moment to resubscribe.
+      if (hasSuccessfulRead &&
+          (uint32_t)(millis() - pendingReadingAcquiredMillis) < pendingReadingMaxAgeMillis) {
+        readingPending = true;
+        nextPublishAttempt = millis() + SMA_REDISCOVERY_REPUBLISH_DELAY_MS;
+      }
     }
   }
   // Retry the most recent complete reading until it is published or superseded.

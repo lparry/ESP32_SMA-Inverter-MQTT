@@ -60,7 +60,14 @@ Wi-Fi failed almost every time (0/5 versus 4/5 inline on the same build, positio
 Home Assistant discovery is retained by the broker, so a broker reconnect does not resend it.
 Discovery is republished at boot, when Home Assistant sends its `online` birth message, when
 day/night expiry changes, and when the inverter identity changes. Readings are only held back
-until this inverter's entities have been announced once.
+until this inverter's entities have been announced once. Re-announcing blanks the entities in
+Home Assistant, so the latest unexpired reading is resent a few seconds afterwards.
+
+Daytime runs from `SUNUP` to `SUNDOWN` by the ESP's clock. Outside that window a read that
+found the grid relay closed keeps daytime polling for `SMA_DAY_HOLD_MS` (20 min), so a few
+failed connects at dusk or dawn don't flip between day and night. At night sensors expire
+after four night scans plus five minutes, so the inverter's Bluetooth can miss up to three
+scans in a row without blanking them.
 
 When the inverter cannot be reached in daylight, the ESP no longer reboots. After two failed
 connections the next attempt waits 2 minutes, then 5, then `SMA_CONNECT_BACKOFF_MAX_MS`

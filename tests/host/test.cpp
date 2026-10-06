@@ -523,7 +523,9 @@ void testStaleRelayExpires(){
  a.appConfig.scanRate=60;ESP32_SMA_Inverter::invData.GridRelay=51;
  a.hasSuccessfulRead=true;a.lastSuccessfulReadMillis=2000000;
  a.appLoop();assert(!a.nightTime);
- fake::ticks+=121000;a.appLoop();assert(a.nightTime);
+ // A missed scan or two at dusk keeps daytime; only a long silence ends it.
+ fake::ticks+=121000;a.appLoop();assert(!a.nightTime);
+ fake::ticks=2000000+SMA_DAY_HOLD_MS;a.appLoop();assert(a.nightTime);
  a.hasSuccessfulRead=false;fake::validTime=true;
 }
 void testNightToDayShortensPollDeadline(){
@@ -1087,6 +1089,30 @@ void testDiscoveryAfterReconnectAndBirth(){
  assert(configs==20);
  uint8_t online[]={'o','n','l','i','n','e'};a.client.callback(const_cast<char*>("homeassistant/status"),online,sizeof(online));assert(a.firstTime);
  a.appLoop();assert(!a.firstTime);i.invData.Serial=0;
+}
+void testRediscoveryResendsLatestReading(){
+ auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();
+ auto config=a.appConfig;auto inv=i.invData;auto disp=i.dispData;
+ const bool savedRead=a.hasSuccessfulRead;const auto savedReadAt=a.lastSuccessfulReadMillis;
+ a.appConfig.mqttBroker="broker";a.appConfig.mqttTopic="SMA";a.appConfig.hassDisc=true;a.appConfig.thisSerial=56;a.appConfig.scanRate=60;
+ i.invData.Serial=56;i.invData.GridRelay=0;m.wifiStartup();WiFi.state=WL_CONNECTED;a.client.online=false;assert(m.brokerConnect());
+ a.pendingReading=i.invData;a.pendingDisplay=i.dispData;a.pendingDisplay.Pac=432;
+ a.hasSuccessfulRead=true;a.lastSuccessfulReadMillis=millis();a.pendingReadingAcquiredMillis=millis();
+ a.pendingReadingMaxAgeMillis=300000;a.readingPending=false;a.discoveredSerial=56;
+ // A day/night change re-announces discovery, which blanks the entities in
+ // Home Assistant. The last reading is resent shortly afterwards.
+ a.firstTime=false;a.dayNight=!a.nightTime;a.nextDiscoveryAttempt=millis();a.nextTime=millis()+100000;
+ a.client.messages.clear();a.appLoop();assert(a.dayNight==a.nightTime);assert(a.readingPending);
+ const std::string stateTopic="sma/solar/SMA-56/state";
+ auto statePublishes=[&]{unsigned n=0;for(const auto&message:a.client.messages)if(message.topic==stateTopic){
+  ++n;StaticJsonDocument<2048> json;assert(!deserializeJson(json,message.payload));assert(json["Pac"]==432);}return n;};
+ assert(statePublishes()==0);
+ fake::ticks+=SMA_REDISCOVERY_REPUBLISH_DELAY_MS;a.nextTime=millis()+100000;a.appLoop();
+ assert(!a.readingPending);assert(statePublishes()==1);
+ // A reading older than its expiry is not resent.
+ fake::ticks+=300000;a.dayNight=!a.nightTime;a.nextDiscoveryAttempt=millis();a.nextTime=millis()+100000;
+ a.client.messages.clear();a.appLoop();assert(a.dayNight==a.nightTime);assert(!a.readingPending);
+ a.appConfig=config;i.invData=inv;i.dispData=disp;a.hasSuccessfulRead=savedRead;a.lastSuccessfulReadMillis=savedReadAt;
 }
 void testClockReplyCorrelation(){
  auto&i=ESP32_SMA_Inverter::getInstance();auto&b=i.serialBT;i.invData.SUSyID=0x1234;i.invData.Serial=55;
@@ -1897,6 +1923,7 @@ int main(){
  testBoundedHttpFormCompatibility();
  testBoundedHttpDeadline();
  testClockReplyCorrelation();
+ testRediscoveryResendsLatestReading();
  testClockTargetsOneInverter();
  testDiscoveryAfterReconnectAndBirth();
  testProvisioningTimeouts();

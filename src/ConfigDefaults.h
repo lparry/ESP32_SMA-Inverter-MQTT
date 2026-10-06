@@ -70,6 +70,17 @@
 #ifndef SMA_CONNECT_BACKOFF_MAX_MS
 #define SMA_CONNECT_BACKOFF_MAX_MS (15UL * 60UL * 1000UL)
 #endif
+// Outside the SUNUP-SUNDOWN window, a read that found the grid relay closed
+// keeps daytime polling for this long. Short enough to fall back to night
+// polling after the inverter sleeps, long enough that a few failed dusk or
+// dawn connects don't flip day/night (each flip re-announces discovery).
+#ifndef SMA_DAY_HOLD_MS
+#define SMA_DAY_HOLD_MS (20UL * 60UL * 1000UL)
+#endif
+// Delay between re-announcing discovery and resending the latest reading.
+#ifndef SMA_REDISCOVERY_REPUBLISH_DELAY_MS
+#define SMA_REDISCOVERY_REPUBLISH_DELAY_MS 5000UL
+#endif
 #ifndef SMA_POLL_TASK_STACK
 #define SMA_POLL_TASK_STACK 8192
 #endif
