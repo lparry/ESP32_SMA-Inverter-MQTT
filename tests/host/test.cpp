@@ -1094,6 +1094,9 @@ void testRediscoveryResendsLatestReading(){
  auto&m=ESP32_SMA_MQTT::getInstance();auto&a=ESP32_SMA_Inverter_App::getInstance();auto&i=ESP32_SMA_Inverter::getInstance();
  auto config=a.appConfig;auto inv=i.invData;auto disp=i.dispData;
  const bool savedRead=a.hasSuccessfulRead;const auto savedReadAt=a.lastSuccessfulReadMillis;
+ const bool savedValidTime=fake::validTime;const int savedLocalHour=fake::localHourOverride;
+ // Pin midday so the result doesn't depend on the host's timezone.
+ fake::validTime=true;fake::localHourOverride=12;
  a.appConfig.mqttBroker="broker";a.appConfig.mqttTopic="SMA";a.appConfig.hassDisc=true;a.appConfig.thisSerial=56;a.appConfig.scanRate=60;
  i.invData.Serial=56;i.invData.GridRelay=0;m.wifiStartup();WiFi.state=WL_CONNECTED;a.client.online=false;assert(m.brokerConnect());
  a.pendingReading=i.invData;a.pendingDisplay=i.dispData;a.pendingDisplay.Pac=432;
@@ -1101,8 +1104,8 @@ void testRediscoveryResendsLatestReading(){
  a.pendingReadingMaxAgeMillis=300000;a.readingPending=false;a.discoveredSerial=56;
  // A day/night change re-announces discovery, which blanks the entities in
  // Home Assistant. The last reading is resent shortly afterwards.
- a.firstTime=false;a.dayNight=!a.nightTime;a.nextDiscoveryAttempt=millis();a.nextTime=millis()+100000;
- a.client.messages.clear();a.appLoop();assert(a.dayNight==a.nightTime);assert(a.readingPending);
+ a.firstTime=false;a.dayNight=true;a.nextDiscoveryAttempt=millis();a.nextTime=millis()+100000;
+ a.client.messages.clear();a.appLoop();assert(!a.nightTime);assert(a.dayNight==a.nightTime);assert(a.readingPending);
  const std::string stateTopic="sma/solar/SMA-56/state";
  auto statePublishes=[&]{unsigned n=0;for(const auto&message:a.client.messages)if(message.topic==stateTopic){
   ++n;StaticJsonDocument<2048> json;assert(!deserializeJson(json,message.payload));assert(json["Pac"]==432);}return n;};
@@ -1113,6 +1116,7 @@ void testRediscoveryResendsLatestReading(){
  fake::ticks+=300000;a.dayNight=!a.nightTime;a.nextDiscoveryAttempt=millis();a.nextTime=millis()+100000;
  a.client.messages.clear();a.appLoop();assert(a.dayNight==a.nightTime);assert(!a.readingPending);
  a.appConfig=config;i.invData=inv;i.dispData=disp;a.hasSuccessfulRead=savedRead;a.lastSuccessfulReadMillis=savedReadAt;
+ fake::validTime=savedValidTime;fake::localHourOverride=savedLocalHour;
 }
 void testClockReplyCorrelation(){
  auto&i=ESP32_SMA_Inverter::getInstance();auto&b=i.serialBT;i.invData.SUSyID=0x1234;i.invData.Serial=55;
