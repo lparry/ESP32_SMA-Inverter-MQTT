@@ -1099,7 +1099,6 @@ bool ESP32_SMA_MQTT::brokerConnect() {
   if(config.mqttBroker.length() < 1 ){
     return false;
   }
-  logW("Connecting to MQTT Broker");
 
   ESP32_SMA_Inverter_App::client.setServer(config.mqttBroker.c_str(), config.mqttPort);
 
@@ -1120,6 +1119,7 @@ bool ESP32_SMA_MQTT::brokerConnect() {
       }
       if (ESP32_SMA_Inverter_App::client.connected()) {
         ++mqttConnects;
+        logW("Connected to MQTT broker (connection %lu since boot)", static_cast<unsigned long>(mqttConnects));
         // Discovery configs are retained by the broker, so a reconnect does
         // not need to resend them. Home Assistant's "online" birth message
         // (subscribed here) still triggers a full re-announcement.
